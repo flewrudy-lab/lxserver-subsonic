@@ -2,6 +2,7 @@ import http from 'http'
 import crypto from 'crypto'
 import { URL } from 'url'
 import { getUserSpace, getUserDirname } from '@/user'
+import { LIST_IDS } from '@/constants'
 import { callUserApiGetMusicUrl } from '@/server/userApi'
 import { getSingerPic, getSingerDetail, getSingerMid } from '@/server/utils/singer'
 import { fetchRecommendedAlbums } from '@/server/utils/recommendAlbums'
@@ -313,6 +314,12 @@ class SubsonicHandler {
                 case 'getStarred2':
                     return this.handleGetStarred(res, username, format, true)
 
+                case 'star':
+                    return this.handleStar(res, username, params, format, false)
+
+                case 'unstar':
+                    return this.handleStar(res, username, params, format, true)
+
                 case 'getRandomSongs':
                 case 'getSongsByGenre':
                 case 'getSongsByGenre2':
@@ -324,6 +331,12 @@ class SubsonicHandler {
 
                 case 'getTopSongs':
                     return this.handleGetTopSongs(res, username, params, format)
+
+                case 'createPlaylist':
+                    return this.handleCreatePlaylist(res, username, params, format)
+
+                case 'deletePlaylist':
+                    return this.handleDeletePlaylist(res, username, params, format)
 
                 case 'updatePlaylist':
                     return this.handleUpdatePlaylist(res, username, params, format)
@@ -721,7 +734,27 @@ class SubsonicHandler {
             }
         }
 
-        // TODO: 支持 songIdToAdd 等其他参数
+        // 支持 songIdToAdd：向歌单追加歌曲（OpenSubsonic 扩展）
+        const songIdToAddList = params.getAll('songIdToAdd').filter(Boolean)
+        if (songIdToAddList.length) {
+            try {
+                const userSpace = getUserSpace(username)
+                const musics: LX.Music.MusicInfo[] = []
+                for (const sid of songIdToAddList) {
+                    const m = await this.resolveMusicById(username, sid, params)
+                    if (m) musics.push(m)
+                }
+                if (musics.length) {
+                    await userSpace.listManage.listDataManage.listMusicAdd(playlistId, musics, 'bottom')
+                    await userSpace.listManage.createSnapshot()
+                }
+                return this.sendResponse(res, {}, format)
+            } catch (err: any) {
+                console.error('[Subsonic] updatePlaylist add error:', err)
+                return this.sendError(res, 0, err.message || 'Failed to add song', format)
+            }
+        }
+
         return this.sendResponse(res, {}, format)
     }
 
@@ -806,20 +839,27 @@ class SubsonicHandler {
             try {
                 const songs = await fetchRadioSongs(radioId)
                 listName = '官方电台' // 默认名，如果有缓存可以查找真实名
-                musics = (songs || []).map((s: any) => ({
-                    id: `tx_${s.songmid || s.mid}`,
-                    name: s.songname || s.name,
-                    singer: (s.singer || []).map((si: any) => si.name).join('、'),
-                    source: 'tx',
-                    songmid: s.songmid || s.mid,
-                    interval: s.interval || 0,
-                    img: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : '',
-                    meta: {
-                        albumName: '官方电台',
-                        albumId: id,
-                        picUrl: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : ''
-                    }
-                } as any))
+                musics = (songs || []).map((s: any) => {
+                    const mid = s.songmid || s.mid
+                    const sname = s.songname || s.name || ''
+                    return {
+                        id: `tx_${mid}`,
+                        name: sname,
+                        singer: (s.singer || []).map((si: any) => si.name).join('、'),
+                        source: 'tx',
+                        songmid: mid,
+                        interval: s.interval || 0,
+                        img: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : '',
+                        meta: {
+                            albumName: '官方电台',
+                            albumId: id,
+                            picUrl: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : ''
+                        }
+                    } as any
+                }).filter((s: any) => {
+                    // [过滤] 丢弃 QQ 电台 API 偶尔返回的垃圾条目：歌名为空、或歌名等于 songmid（如 002h05oC3ZQmPZ）
+                    return s.songmid && s.name && s.name !== s.songmid
+                })
             } catch (e) {
                 console.error(`[Subsonic] Fetch radio songs failed:`, e)
             }
@@ -955,8 +995,33 @@ class SubsonicHandler {
             const parts = id.split('_')
             const source = parts[0]
             const songmid = parts.slice(1).join('_')
-            const title = params.get('title') || params.get('name') || songmid
-            const singer = params.get('artist') || params.get('singer') || 'Unknown Artist'
+            let title = params.get('title') || params.get('name') || ''
+            let singer = params.get('artist') || params.get('singer') || ''
+            // [修复] 如果 title 就是 songmid（说明没有真正的元数据），尝试在线搜索补全
+            if (!title || title === songmid) {
+                try {
+                    console.log(`[Subsonic] getSong: no metadata for ${id}, attempting online lookup`)
+                    const searchSources = ['tx', 'wy', 'kw', 'kg', 'mg']
+                    for (const src of searchSources) {
+                        if (!musicSdk[src]?.musicSearch?.search) continue
+                        try {
+                            const searchRes = await musicSdk[src].musicSearch.search(songmid, 1, 5)
+                            const list = Array.isArray(searchRes?.list) ? searchRes.list : []
+                            const match = list.find((item: any) => String(item.songmid || item.id || '') === songmid) || list[0]
+                            if (match && match.name) {
+                                title = match.name
+                                singer = match.singer || singer || 'Unknown Artist'
+                                console.log(`[Subsonic] getSong: resolved metadata for ${id} from ${src}: ${title} - ${singer}`)
+                                break
+                            }
+                        } catch (_) { /* continue to next source */ }
+                    }
+                } catch (e: any) {
+                    console.warn(`[Subsonic] getSong: online metadata lookup failed for ${id}:`, e?.message)
+                }
+            }
+            if (!title) title = songmid
+            if (!singer) singer = 'Unknown Artist'
             music = {
                 id,
                 name: title,
@@ -1040,20 +1105,27 @@ class SubsonicHandler {
             try {
                 const songs = await fetchRadioSongs(radioId)
                 dirName = '电台列表'
-                musics = (songs || []).map((s: any) => ({
-                    id: `tx_${s.songmid || s.mid}`,
-                    name: s.songname || s.name,
-                    singer: (s.singer || []).map((si: any) => si.name).join('、'),
-                    source: 'tx',
-                    songmid: s.songmid || s.mid,
-                    interval: s.interval || 0,
-                    img: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : '',
-                    meta: {
-                        albumName: '官方电台',
-                        albumId: id,
-                        picUrl: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : ''
-                    }
-                } as any))
+                musics = (songs || []).map((s: any) => {
+                    const mid = s.songmid || s.mid
+                    const sname = s.songname || s.name || ''
+                    return {
+                        id: `tx_${mid}`,
+                        name: sname,
+                        singer: (s.singer || []).map((si: any) => si.name).join('、'),
+                        source: 'tx',
+                        songmid: mid,
+                        interval: s.interval || 0,
+                        img: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : '',
+                        meta: {
+                            albumName: '官方电台',
+                            albumId: id,
+                            picUrl: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : ''
+                        }
+                    } as any
+                }).filter((s: any) => {
+                    // [过滤] 丢弃 QQ 电台 API 偶尔返回的垃圾条目：歌名为空、或歌名等于 songmid（如 002h05oC3ZQmPZ）
+                    return s.songmid && s.name && s.name !== s.songmid
+                })
             } catch (e) {
                 console.error(`[Subsonic] Fetch radio songs failed:`, e)
             }
@@ -1821,6 +1893,109 @@ class SubsonicHandler {
         }, format)
     }
 
+    // 通过 Subsonic 协议创建歌单
+    private async handleCreatePlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
+        const name = params.get('name') || '新建歌单'
+        const songIds = params.getAll('songId').filter(Boolean)
+        const userSpace = getUserSpace(username)
+        const id = 'usr_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
+        await userSpace.listManage.listDataManage.userListCreate({ name, id, position: -1, locationUpdateTime: Date.now() })
+        const musics: LX.Music.MusicInfo[] = []
+        for (const sid of songIds) {
+            const m = await this.resolveMusicById(username, sid, params)
+            if (m) musics.push(m)
+        }
+        if (musics.length) {
+            await userSpace.listManage.listDataManage.listMusicAdd(id, musics, 'bottom')
+        }
+        await userSpace.listManage.createSnapshot()
+        return this.sendResponse(res, {}, format)
+    }
+
+    // 通过 Subsonic 协议删除歌单
+    private async handleDeletePlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
+        const playlistId = params.get('id')
+        if (!playlistId)
+            return this.sendError(res, 10, 'Required parameter is missing: id', format)
+        const userSpace = getUserSpace(username)
+        await userSpace.listManage.listDataManage.userListsRemove([playlistId])
+        await userSpace.listManage.createSnapshot()
+        return this.sendResponse(res, {}, format)
+    }
+
+    // 通过 Subsonic 协议收藏/取消收藏歌曲
+    // star -> 加入“我喜欢的”列表；unstar -> 从“我喜欢的”列表移除
+    private async handleStar(
+        res: http.ServerResponse,
+        username: string,
+        params: URLSearchParams,
+        format: string,
+        isUnstar: boolean,
+    ) {
+        const ids = params.getAll('id').filter(Boolean)
+        const userSpace = getUserSpace(username)
+
+        if (isUnstar) {
+            if (ids.length) {
+                await userSpace.listManage.listDataManage.listMusicRemove(LIST_IDS.LOVE, ids)
+            }
+        } else {
+            const musics: LX.Music.MusicInfo[] = []
+            for (const id of ids) {
+                const m = await this.resolveMusicById(username, id, params)
+                if (m) musics.push(m)
+            }
+            if (musics.length) {
+                await userSpace.listManage.listDataManage.listMusicAdd(LIST_IDS.LOVE, musics, 'bottom')
+            }
+        }
+
+        // 持久化快照，确保重启后收藏不丢失
+        await userSpace.listManage.createSnapshot()
+        return this.sendResponse(res, {}, format)
+    }
+
+    // 根据 Subsonic 歌曲 id（格式为 `${source}_${songId}`）解析出完整 MusicInfo
+    private async resolveMusicById(username: string, id: string, params?: URLSearchParams): Promise<LX.Music.MusicInfo | null> {
+        // 在线搜索结果可能不在用户歌单中，优先查缓存
+        const cached = this.onlineSongCache.get(id)
+        if (cached) return cached
+
+        const userSpace = getUserSpace(username)
+        const listData = await userSpace.listManage.getListData()
+        const lists: LX.Music.MusicInfo[][] = [
+            listData.loveList,
+            listData.defaultList,
+            ...listData.userList.map((l: any) => (l.list || []) as LX.Music.MusicInfo[]),
+        ]
+        for (const list of lists) {
+            for (const m of list) {
+                if (m.id === id) return m
+            }
+        }
+
+        // [fallback] 歌曲不在任何本地歌单中（例如刚在客户端浏览过但尚未收藏），
+        // 则根据 Subsonic id（格式 `${source}_${songId}`）反推最小可用 MusicInfo，
+        // 保证 star / 加入歌单 等操作对“在线浏览但未收藏”的歌曲也能生效。
+        if (id.includes('_')) {
+            const parts = id.split('_')
+            const source = parts[0]
+            const songmid = parts.slice(1).join('_')
+            const title = (params && (params.get('title') || params.get('name'))) || songmid
+            const singer = (params && (params.get('artist') || params.get('singer'))) || 'Unknown Artist'
+            return {
+                id,
+                name: title,
+                singer,
+                source: source as LX.OnlineSource,
+                songmid,
+                interval: '0',
+                meta: { songId: songmid },
+            } as LX.Music.MusicInfo
+        }
+        return null
+    }
+
     private async handleGetRandomSongs(
         res: http.ServerResponse,
         username: string,
@@ -1848,7 +2023,7 @@ class SubsonicHandler {
                     const target = genres.find(g => g.value === genreNameOrId)
                     if (target) categoryId = target.id
                 }
-                const cloudSongs = await fetchSongsByGenre(categoryId, fetchSize)
+                const cloudSongs = (await fetchSongsByGenre(categoryId, fetchSize)).filter((s: any) => s && s.name && s.songmid && s.name !== s.songmid)
                 if (cloudSongs.length > 0) {
                     const parentId = `genre_${genreNameOrId}`
                     const picked = cloudSongs.map((s: any) => ({ music: s, listId: parentId }))
@@ -2048,11 +2223,88 @@ class SubsonicHandler {
                 res.writeHead(302, { Location: result.url })
                 res.end()
             } else {
+                // [fallback] 主音源取不到播放地址时，跨其它已启用音源按"歌名+歌手"重新搜索并试播，
+                // 解决推荐/收藏歌曲在原绑定音源无版权/下架/接口异常时无法播放的问题
+                const fbUrl = await this.resolveViaFallbackSources(username, source, found, musicInfo, quality, params)
+                if (fbUrl) {
+                    res.writeHead(302, { Location: fbUrl })
+                    res.end()
+                    return
+                }
                 return this.sendError(res, 0, 'Could not resolve music URL', format)
             }
         } catch (err: any) {
             return this.sendError(res, 0, err.message || 'Stream error', format)
         }
+    }
+
+    private async resolveViaFallbackSources(
+        username: string,
+        originalSource: string,
+        found: { music: LX.Music.MusicInfo, listId: string } | null,
+        musicInfo: any,
+        quality: string,
+        params: URLSearchParams,
+    ): Promise<string | null> {
+        let title = (found && found.music && (found.music as any).name) || musicInfo.name || params.get('title') || params.get('name') || ''
+        let singer = (found && found.music && (found.music as any).singer) || musicInfo.singer || params.get('artist') || params.get('singer') || ''
+        // [修复] 如果没有标题但有 songmid，先通过 songmid 在线反查元数据
+        const songmid = musicInfo.songmid || ''
+        if (!title && songmid) {
+            try {
+                console.log(`[Subsonic] Fallback: no metadata for ${originalSource}_${songmid}, attempting songmid lookup`)
+                const searchSources = ['tx', 'wy', 'kw', 'kg', 'mg']
+                for (const src of searchSources) {
+                    if (!musicSdk[src]?.musicSearch?.search) continue
+                    try {
+                        const searchRes = await musicSdk[src].musicSearch.search(songmid, 1, 5)
+                        const list = Array.isArray(searchRes?.list) ? searchRes.list : []
+                        const match = list.find((item: any) => String(item.songmid || item.id || '') === songmid) || list[0]
+                        if (match && match.name) {
+                            title = match.name
+                            singer = match.singer || singer || ''
+                            console.log(`[Subsonic] Fallback: resolved metadata from ${src}: ${title} - ${singer}`)
+                            break
+                        }
+                    } catch (_) { /* continue */ }
+                }
+            } catch (e: any) {
+                console.warn(`[Subsonic] Fallback: songmid lookup failed:`, e?.message)
+            }
+        }
+        if (!title) return null
+        let sources = String(global.lx.config['subsonic.onlineSearchSources'] || 'wy,tx,kw,kg,mg').split(',').map((s: string) => s.trim()).filter(Boolean)
+        sources = sources.filter((s: string) => s !== originalSource && ['wy', 'tx', 'kw', 'kg', 'mg'].includes(s))
+        if (!sources.length) return null
+        const query = `${title} ${singer}`.trim()
+        let results: { music: LX.Music.MusicInfo, listId: string }[] = []
+        try {
+            results = await this.fetchOnlineSearchSongs(query, sources, 30)
+        } catch (e: any) {
+            console.error('[Subsonic] Fallback search failed:', e && e.message ? e.message : e)
+            return null
+        }
+        if (!results.length) return null
+        const norm = (s: string) => String(s || '').toLowerCase().replace(/\s+/g, '')
+        const tN = norm(title)
+        const sN = norm(singer)
+        const pick = results.find((r) => {
+            const n = norm((r.music as any).name)
+            const sn = norm((r.music as any).singer)
+            const nameOk = tN.includes(n) || n.includes(tN)
+            const singerOk = sN === '' || sn.includes(sN) || sN.includes(sn)
+            return nameOk && singerOk
+        }) || results[0]
+        try {
+            const r2 = await callUserApiGetMusicUrl(pick.music.source as any, pick.music as any, quality, username)
+            if (r2 && r2.url) {
+                console.log(`[Subsonic] Fallback stream ok: ${originalSource}_${musicInfo.songmid} -> ${pick.music.id}`)
+                return r2.url
+            }
+        } catch (e: any) {
+            console.error('[Subsonic] Fallback URL resolve failed:', e && e.message ? e.message : e)
+        }
+        return null
     }
 
     private async handleGetCoverArt(
