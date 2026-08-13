@@ -58,6 +58,10 @@ const config: LX.Config = {
   'subsonic.onlineSearch': true, // 是否开启 Subsonic 在线全网搜索
   'subsonic.onlineSearchMode': 'fallback', // 在线搜索模式: fallback | merge | local_only
   'subsonic.onlineSearchSources': 'wy,tx,kw,kg,mg', // 在线搜索默认平台
+  'subsonic.onlinePlaylists': true, // 是否把平台在线歌单(如网易云)暴露到 Subsonic 歌单列表
+  'subsonic.onlinePlaylistSource': 'wy', // 在线歌单来源平台: wy(网易云) | tx | kw | kg | mg
+  'subsonic.onlinePlaylistCount': 20, // 歌单列表最多暴露的在线歌单数量
+  'subsonic.onlinePlaylistSongCap': 300, // 单个在线歌单最多返回的歌曲数(防止超大 payload)
   'subsonic.lyricTranslation': true, // 是否在 Subsonic 歌词中包含翻译
   'singer.sourcePriority': ['tx', 'wy'], // 歌手信息源优先级
   'artist.maxFetchPages': 20, // 歌手歌曲最大抓取页数

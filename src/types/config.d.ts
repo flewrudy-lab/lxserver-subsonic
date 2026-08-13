@@ -226,6 +226,26 @@ declare namespace LX {
     'subsonic.onlineSearchSources'?: string
 
     /**
+     * 是否把平台在线歌单(如网易云)暴露到 Subsonic 歌单列表 (默认 true)
+     */
+    'subsonic.onlinePlaylists'?: boolean
+
+    /**
+     * 在线歌单来源平台 (wy | tx | kw | kg | mg)，默认 wy(网易云)
+     */
+    'subsonic.onlinePlaylistSource'?: string
+
+    /**
+     * 歌单列表最多暴露的在线歌单数量 (默认 20)
+     */
+    'subsonic.onlinePlaylistCount'?: number
+
+    /**
+     * 单个在线歌单最多返回的歌曲数，防止超大 payload (默认 300)
+     */
+    'subsonic.onlinePlaylistSongCap'?: number
+
+    /**
      * Subsonic 歌词是否包含翻译 (默认 true)
      */
     'subsonic.lyricTranslation'?: boolean

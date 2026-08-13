@@ -22,6 +22,9 @@ const musicSdk = musicSdkRaw as any
  *  - JSON (f=json)：所有数据函数返回平铺的 JS 对象，sendResponse 直接 JSON.stringify
  *  - XML (默认)：数据函数返回 {attrs, children} 嵌套结构，toXml 负责渲染
  */
+// [电台] 电台名称缓存，避免每次请求都打 QQ 音乐 API
+const radioNameCache = new Map<string, { name: string; ts: number }>()
+
 class SubsonicHandler {
     private readonly VERSION = '1.16.1'
     private readonly SERVER_VERSION = '1.0.0'
@@ -31,6 +34,25 @@ class SubsonicHandler {
 
     // 在线全网搜索歌曲缓存 (ID -> MusicInfo)，确保后续 getSong / getCoverArt / getLyrics 能精准查到歌曲元数据
     private onlineSongCache = new Map<string, LX.Music.MusicInfo>()
+
+    // [在线歌单] 在线歌单(列表/详情)缓存，避免每次请求都打平台 API
+    // 结构: key -> { data, expires }
+    private onlinePlaylistCache = new Map<string, { data: any, expires: number }>()
+
+    private getOnlinePlaylistCache(key: string, ttlMs: number): any | null {
+        const hit = this.onlinePlaylistCache.get(key)
+        if (hit && hit.expires > Date.now()) return hit.data
+        if (hit) this.onlinePlaylistCache.delete(key)
+        return null
+    }
+
+    private setOnlinePlaylistCache(key: string, data: any, ttlMs: number) {
+        if (this.onlinePlaylistCache.size > 200) {
+            const firstKey = this.onlinePlaylistCache.keys().next().value
+            if (firstKey) this.onlinePlaylistCache.delete(firstKey)
+        }
+        this.onlinePlaylistCache.set(key, { data, expires: Date.now() + ttlMs })
+    }
 
     private cacheOnlineSong(music: LX.Music.MusicInfo) {
         if (!music || !music.id) return
@@ -326,8 +348,9 @@ class SubsonicHandler {
                     return this.handleGetRandomSongs(res, username, params, format)
 
                 case 'getSimilarSongs':
+                    return this.handleGetSimilarSongs(res, username, params, format, false)
                 case 'getSimilarSongs2':
-                    return this.handleGetSimilarSongs(res, username, params, format)
+                    return this.handleGetSimilarSongs(res, username, params, format, true)
 
                 case 'getTopSongs':
                     return this.handleGetTopSongs(res, username, params, format)
@@ -632,6 +655,29 @@ class SubsonicHandler {
             ))
         }
 
+        // [在线歌单] 把平台在线歌单(如网易云热门歌单)暴露到 Subsonic 歌单列表
+        if (global.lx.config['subsonic.onlinePlaylists'] !== false) {
+            try {
+                const summaries = await this.fetchOnlinePlaylistSummaries()
+                for (const pl of summaries) {
+                    playlists.push({
+                        id: `onlinepl_${pl.source}_${pl.id}`,
+                        name: pl.name,
+                        comment: `在线歌单 · ${pl.author || pl.source}`,
+                        owner: 'lxserver',
+                        public: false,
+                        songCount: pl.total || 0,
+                        duration: 0,
+                        created: new Date().toISOString(),
+                        changed: new Date().toISOString(),
+                        coverArt: pl.img || 'logo',
+                    })
+                }
+            } catch (e: any) {
+                console.error('[Subsonic] fetch online playlists failed:', e?.message || e)
+            }
+        }
+
         if (format === 'json') {
             return this.sendResponse(res, { playlists: { playlist: playlists } }, format)
         }
@@ -643,6 +689,15 @@ class SubsonicHandler {
     private async handleGetPlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
+
+        // [在线歌单] 解析合成 ID: onlinepl_<source>_<playlistId>
+        if (id.startsWith('onlinepl_')) {
+            const rest = id.slice('onlinepl_'.length)
+            const underlineIdx = rest.indexOf('_')
+            const source = underlineIdx > 0 ? rest.slice(0, underlineIdx) : (String(global.lx.config['subsonic.onlinePlaylistSource'] || 'wy'))
+            const playlistId = underlineIdx > 0 ? rest.slice(underlineIdx + 1) : rest
+            return this.handleGetOnlinePlaylist(res, id, source, playlistId, format)
+        }
 
         const userSpace = getUserSpace(username)
         const listData = await userSpace.listManage.getListData()
@@ -698,6 +753,128 @@ class SubsonicHandler {
                 },
             },
         }, format)
+    }
+
+    // ─────────────────────────────────────────────
+    // [在线歌单] 平台在线歌单(网易云等)桥接
+    // ─────────────────────────────────────────────
+
+    /**
+     * 获取在线歌单的概要列表(用于 Subsonic getPlaylists 展示)。
+     * 复用 musicSdk[source].songList.getList，带 TTL 缓存。
+     */
+    private async fetchOnlinePlaylistSummaries(page = 1): Promise<any[]> {
+        const source = String(global.lx.config['subsonic.onlinePlaylistSource'] || 'wy')
+        if (!musicSdk[source]?.songList?.getList) return []
+        const count = Math.max(1, Math.min(50, parseInt(String(global.lx.config['subsonic.onlinePlaylistCount'] || '20')) || 20))
+        const cacheKey = `summaries_${source}_${page}_${count}`
+        const cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
+        if (cached) return cached
+
+        const res = await musicSdk[source].songList.getList('hot', '', page)
+        const list = ((res && res.list) || []).slice(0, count).map((p: any) => ({
+            id: String(p.id),
+            name: p.name || '未命名歌单',
+            author: p.author || '',
+            total: p.total || p.trackCount || 0,
+            img: p.img || '',
+            source,
+        }))
+        this.setOnlinePlaylistCache(cacheKey, list, 10 * 60 * 1000)
+        return list
+    }
+
+    /**
+     * 解析在线歌单 ID，调用 musicSdk[source].songList.getListDetail 返回歌曲。
+     * 歌曲沿用现有在线播放链路(stream/getSong 按 wy_<songmid> 解析)。
+     */
+    private async handleGetOnlinePlaylist(res: http.ServerResponse, id: string, source: string, playlistId: string, format: string) {
+        if (!musicSdk[source]?.songList?.getListDetail) {
+            return this.sendError(res, 70, `Online playlist source ${source} not supported`, format)
+        }
+
+        const cacheKey = `detail_${source}_${playlistId}`
+        let cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
+        let musics: LX.Music.MusicInfo[]
+        let listName: string
+        let coverArt: string
+
+        if (cached) {
+            musics = cached.musics
+            listName = cached.name
+            coverArt = cached.coverArt
+        } else {
+            const detail = await musicSdk[source].songList.getListDetail(playlistId, 1)
+            listName = detail?.info?.name || '在线歌单'
+            coverArt = detail?.info?.img || 'logo'
+            const all = (detail && detail.list) || []
+            const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
+            musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, source))
+            this.setOnlinePlaylistCache(cacheKey, { musics, name: listName, coverArt }, 10 * 60 * 1000)
+        }
+
+        // 把歌曲元数据缓存，供后续 getSong / getCoverArt / getLyrics 精准命中
+        for (const m of musics) this.cacheOnlineSong(m)
+
+        const playlistMeta = {
+            id,
+            name: listName,
+            comment: `在线歌单 · ${source}`,
+            owner: 'lxserver',
+            public: false,
+            songCount: musics.length,
+            duration: musics.reduce((sum: number, m: any) => sum + this.parseDuration(m.interval), 0),
+            created: new Date().toISOString(),
+            changed: new Date().toISOString(),
+            coverArt,
+        }
+
+        if (format === 'json') {
+            return this.sendResponse(res, {
+                playlist: {
+                    ...playlistMeta,
+                    entry: musics.map((m: LX.Music.MusicInfo) => this.musicToSongFlat(m, id)),
+                },
+            }, format)
+        }
+
+        return this.sendResponse(res, {
+            playlist: {
+                attrs: playlistMeta,
+                children: {
+                    entry: musics.map((m: LX.Music.MusicInfo) => this.musicToSongXml(m, id)),
+                },
+            },
+        }, format)
+    }
+
+    /**
+     * 把平台原始歌曲对象(如网易云 songList.getListDetail 的列表项)构造为标准 MusicInfo，
+     * 使其 id 形如 <source>_<songmid>，可被现有在线播放链路解析。
+     */
+    private buildOnlineMusic(s: any, source: string): LX.Music.MusicInfo {
+        const songmid = String(s.songmid || s.id || '')
+        const sid = s.source || source
+        const id = `${sid}_${songmid}`
+        return {
+            id,
+            name: s.name || '未知歌曲',
+            singer: s.singer || 'Unknown Artist',
+            source: sid,
+            songmid,
+            interval: s.interval || 0,
+            img: s.img || '',
+            albumName: s.albumName || '',
+            albumId: s.albumId || '',
+            types: s.types,
+            _types: s._types,
+            meta: {
+                albumName: s.albumName || '',
+                albumId: s.albumId || '',
+                picUrl: s.img || '',
+                songId: songmid,
+            },
+        } as any
     }
 
     private async handleUpdatePlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
@@ -834,34 +1011,14 @@ class SubsonicHandler {
                 }
             */
         } else if (id.startsWith('radio_tx_')) {
-            // [新增] 处理电台详情，作为虚拟专辑返回
+            // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
             const radioId = id.replace('radio_tx_', '')
             try {
-                const songs = await fetchRadioSongs(radioId)
-                listName = '官方电台' // 默认名，如果有缓存可以查找真实名
-                musics = (songs || []).map((s: any) => {
-                    const mid = s.songmid || s.mid
-                    const sname = s.songname || s.name || ''
-                    return {
-                        id: `tx_${mid}`,
-                        name: sname,
-                        singer: (s.singer || []).map((si: any) => si.name).join('、'),
-                        source: 'tx',
-                        songmid: mid,
-                        interval: s.interval || 0,
-                        img: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : '',
-                        meta: {
-                            albumName: '官方电台',
-                            albumId: id,
-                            picUrl: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : ''
-                        }
-                    } as any
-                }).filter((s: any) => {
-                    // [过滤] 丢弃 QQ 电台 API 偶尔返回的垃圾条目：歌名为空、或歌名等于 songmid（如 002h05oC3ZQmPZ）
-                    return s.songmid && s.name && s.name !== s.songmid
-                })
+                const radioName = await this.getRadioName(radioId)
+                listName = radioName
+                musics = [ this.buildRadioPseudoTrack(radioId, radioName) ]
             } catch (e) {
-                console.error(`[Subsonic] Fetch radio songs failed:`, e)
+                console.error(`[Subsonic] Resolve radio name failed:`, e)
             }
         } else if (id.startsWith('alb_tx_playlist_')) {
             // [新增] 处理虚拟出的歌单详情
@@ -979,12 +1136,52 @@ class SubsonicHandler {
         }, format)
     }
 
+    // [电台] 解析电台名称（带 30 分钟缓存），找不到时回退到通用名
+    private async getRadioName(radioId: string): Promise<string> {
+        const cached = radioNameCache.get(radioId)
+        const now = Date.now()
+        if (cached && now - cached.ts < 30 * 60 * 1000) return cached.name
+        try {
+            const radios = await fetchRadios()
+            const r = (radios || []).find((x: any) => x.id === `radio_tx_${radioId}`)
+            const name = r?.name || 'QQ音乐电台'
+            radioNameCache.set(radioId, { name, ts: now })
+            return name
+        } catch {
+            return 'QQ音乐电台'
+        }
+    }
+
+    // [电台] 构造一个"电台站"伪曲目，使客户端把它当作电台整体而非单曲记录，避免污染最近播放
+    private buildRadioPseudoTrack(radioId: string, radioName: string): LX.Music.MusicInfo {
+        return {
+            id: `radio_tx_${radioId}`,
+            name: radioName,
+            singer: 'QQ音乐电台',
+            source: 'tx',
+            songmid: radioId,
+            interval: 0,
+            img: '',
+            meta: { albumName: '官方电台', picUrl: '' },
+        } as any
+    }
+
     private async handleGetSong(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
         const id = params.get('id')
         if (!id) return this.sendError(res, 10, 'Required parameter is missing: id', format)
 
         let music: LX.Music.MusicInfo | null = null
         let listId = 'online'
+
+        if (id.startsWith('radio_tx_')) {
+            const radioId = id.replace('radio_tx_', '')
+            const radioName = await this.getRadioName(radioId)
+            const radioMusic = this.buildRadioPseudoTrack(radioId, radioName)
+            if (format === 'json') {
+                return this.sendResponse(res, { song: this.musicToSongFlat(radioMusic, id) }, format)
+            }
+            return this.sendResponse(res, { song: this.musicToSongXml(radioMusic, id) }, format)
+        }
 
         const found = await this.findMusicById(username, id)
         if (found) {
@@ -1100,34 +1297,14 @@ class SubsonicHandler {
         let dirName = 'Unknown'
 
         if (id.startsWith('radio_tx_')) {
-            // [新增] 返回具体电台内的歌曲
+            // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
             const radioId = id.replace('radio_tx_', '')
             try {
-                const songs = await fetchRadioSongs(radioId)
-                dirName = '电台列表'
-                musics = (songs || []).map((s: any) => {
-                    const mid = s.songmid || s.mid
-                    const sname = s.songname || s.name || ''
-                    return {
-                        id: `tx_${mid}`,
-                        name: sname,
-                        singer: (s.singer || []).map((si: any) => si.name).join('、'),
-                        source: 'tx',
-                        songmid: mid,
-                        interval: s.interval || 0,
-                        img: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : '',
-                        meta: {
-                            albumName: '官方电台',
-                            albumId: id,
-                            picUrl: s.albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${s.albummid}.jpg` : ''
-                        }
-                    } as any
-                }).filter((s: any) => {
-                    // [过滤] 丢弃 QQ 电台 API 偶尔返回的垃圾条目：歌名为空、或歌名等于 songmid（如 002h05oC3ZQmPZ）
-                    return s.songmid && s.name && s.name !== s.songmid
-                })
+                const radioName = await this.getRadioName(radioId)
+                dirName = radioName
+                musics = [ this.buildRadioPseudoTrack(radioId, radioName) ]
             } catch (e) {
-                console.error(`[Subsonic] Fetch radio songs failed:`, e)
+                console.error(`[Subsonic] Resolve radio name failed:`, e)
             }
         } else if (id === 'love') {
             musics = listData.loveList
@@ -2074,6 +2251,7 @@ class SubsonicHandler {
         username: string,
         params: URLSearchParams,
         format: string,
+        useV2: boolean = false,
     ) {
         const id = params.get('id')
         const count = Math.min(parseInt(params.get('count') || '10'), 50)
@@ -2109,7 +2287,7 @@ class SubsonicHandler {
         }
         const picked = candidates.slice(0, count)
 
-        const wrapKey = 'similarSongs2'
+        const wrapKey = useV2 ? 'similarSongs2' : 'similarSongs'
 
         if (format === 'json') {
             return this.sendResponse(res, {
