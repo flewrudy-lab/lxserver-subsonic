@@ -226,17 +226,37 @@ declare namespace LX {
     'subsonic.onlineSearchSources'?: string
 
     /**
-     * 是否把平台在线歌单(如网易云)暴露到 Subsonic 歌单列表 (默认 true)
+     * 是否把平台在线歌单(分类/按标签)暴露到 Subsonic 歌单列表 (默认 true)
      */
     'subsonic.onlinePlaylists'?: boolean
 
     /**
-     * 在线歌单来源平台 (wy | tx | kw | kg | mg)，默认 wy(网易云)
+     * 暴露哪些平台的在线歌单(逗号分隔): wy(网易云) | tx(QQ音乐) | kw | kg | mg，默认 'wy,tx'
+     */
+    'subsonic.onlinePlaylistSources'?: string
+
+    /**
+     * 单平台回退值 (当 onlinePlaylistSources 未设置时生效)，默认 wy(网易云)
      */
     'subsonic.onlinePlaylistSource'?: string
 
     /**
-     * 歌单列表最多暴露的在线歌单数量 (默认 20)
+     * 可选: 覆盖网易云分类(逗号分隔, 如 华语,古风,欧美)，留空用内置默认分类
+     */
+    'subsonic.onlinePlaylistTags'?: string
+
+    /**
+     * 每个平台最多取多少个分类(标签) (默认 8)
+     */
+    'subsonic.onlinePlaylistMaxTags'?: number
+
+    /**
+     * 每个分类最多暴露多少个热门歌单 (默认 6)
+     */
+    'subsonic.onlinePlaylistPerTag'?: number
+
+    /**
+     * 歌单列表最多暴露的在线歌单总数(硬上限) (默认 100)
      */
     'subsonic.onlinePlaylistCount'?: number
 

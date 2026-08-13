@@ -39,6 +39,10 @@ class SubsonicHandler {
     // 结构: key -> { data, expires }
     private onlinePlaylistCache = new Map<string, { data: any, expires: number }>()
 
+    // [在线歌单] 歌单元数据(分类/展示名)映射: key = `${source}:${playlistId}` -> { tag, displayName }
+    // 用于 getPlaylist 时还原 [分类] 前缀展示名(即使列表缓存已冷也能对齐网页)
+    private onlinePlaylistMeta = new Map<string, { tag: string, displayName: string }>()
+
     private getOnlinePlaylistCache(key: string, ttlMs: number): any | null {
         const hit = this.onlinePlaylistCache.get(key)
         if (hit && hit.expires > Date.now()) return hit.data
@@ -663,7 +667,7 @@ class SubsonicHandler {
                     playlists.push({
                         id: `onlinepl_${pl.source}_${pl.id}`,
                         name: pl.name,
-                        comment: `在线歌单 · ${pl.author || pl.source}`,
+                        comment: `在线歌单 · ${pl.tag || pl.source}`,
                         owner: 'lxserver',
                         public: false,
                         songCount: pl.total || 0,
@@ -763,36 +767,133 @@ class SubsonicHandler {
      * 获取在线歌单的概要列表(用于 Subsonic getPlaylists 展示)。
      * 复用 musicSdk[source].songList.getList，带 TTL 缓存。
      */
-    private async fetchOnlinePlaylistSummaries(page = 1): Promise<any[]> {
-        const source = String(global.lx.config['subsonic.onlinePlaylistSource'] || 'wy')
-        if (!musicSdk[source]?.songList?.getList) return []
-        const count = Math.max(1, Math.min(50, parseInt(String(global.lx.config['subsonic.onlinePlaylistCount'] || '20')) || 20))
-        const cacheKey = `summaries_${source}_${page}_${count}`
+    // 解析要暴露哪些平台的在线歌单(逗号分隔)
+    private getOnlineSources(): string[] {
+        const raw = global.lx.config['subsonic.onlinePlaylistSources']
+        if (raw && typeof raw === 'string' && raw.trim()) {
+            return raw.split(',').map((s) => s.trim()).filter(Boolean)
+        }
+        const fallback = global.lx.config['subsonic.onlinePlaylistSource'] || 'wy,tx'
+        return String(fallback).split(',').map((s) => s.trim()).filter(Boolean)
+    }
+
+    // 网易云分类标签(可用配置覆盖)
+    private async getWyTags(): Promise<{ name: string; id: string }[]> {
+        const override = global.lx.config['subsonic.onlinePlaylistTags']
+        if (override && typeof override === 'string' && override.trim()) {
+            return override.split(',').map((t) => t.trim()).filter(Boolean).map((t) => ({ name: t, id: t }))
+        }
+        // 内置默认分类(取自网易云 cat 参数常用值，覆盖华语/古风/欧美等)
+        const defaultTags = ['华语', '欧美', '古风', '流行', '轻音乐', '摇滚', '电子', '民谣', '经典', '翻唱']
+        return defaultTags.map((t) => ({ name: t, id: t }))
+    }
+
+    // QQ音乐分类(语种/流派)，来自网页版 discovery 同一套接口
+    private async getTxTags(): Promise<{ name: string; id: string }[]> {
+        const cacheKey = 'tx_genres'
+        const cached = this.getOnlinePlaylistCache(cacheKey, 30 * 60 * 1000)
+        if (cached) return cached
+        let genres: { name: string; id: string }[] = []
+        try {
+            const items = await fetchGenres()
+            genres = (items || []).map((g: any) => ({ name: String(g.value || g.name), id: String(g.id) }))
+        } catch (e: any) {
+            console.error('[Subsonic] fetch QQ genres failed:', e?.message || e)
+        }
+        this.setOnlinePlaylistCache(cacheKey, genres, 30 * 60 * 1000)
+        return genres
+    }
+
+    // 取某分类下的热门歌单(带 TTL 缓存)
+    private async fetchPlaylistsByTag(source: string, tag: { name: string; id: string }, perTag: number): Promise<any[]> {
+        const cacheKey = `byTag_${source}_${tag.id}_${perTag}`
         const cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
         if (cached) return cached
+        let lists: any[] = []
+        try {
+            if (source === 'tx') {
+                const raw = await fetchPlaylistsByGenre(tag.id, perTag)
+                lists = (raw || []).map((p: any) => {
+                    const dissid = String(p.id || '').replace('alb_tx_playlist_', '')
+                    return { id: dissid, name: p.name || p.title || '未命名歌单', total: p.songCount || 0, img: p.coverArt || '', source: 'tx' }
+                })
+            } else {
+                const res = await musicSdk[source]?.songList?.getList('hot', tag.name, 1)
+                lists = ((res && res.list) || []).slice(0, perTag).map((p: any) => ({
+                    id: String(p.id),
+                    name: p.name || '未命名歌单',
+                    total: p.total || p.trackCount || 0,
+                    img: p.img || '',
+                    source,
+                }))
+            }
+        } catch (e: any) {
+            console.error(`[Subsonic] fetch playlists by tag ${source}/${tag.name} failed:`, e?.message || e)
+        }
+        this.setOnlinePlaylistCache(cacheKey, lists, 10 * 60 * 1000)
+        return lists
+    }
 
-        const res = await musicSdk[source].songList.getList('hot', '', page)
-        const list = ((res && res.list) || []).slice(0, count).map((p: any) => ({
-            id: String(p.id),
-            name: p.name || '未命名歌单',
-            author: p.author || '',
-            total: p.total || p.trackCount || 0,
-            img: p.img || '',
-            source,
-        }))
-        this.setOnlinePlaylistCache(cacheKey, list, 10 * 60 * 1000)
-        return list
+    // 单飞锁：同一时刻只允许一个在线歌单抓取在进行。
+    // 原因：网易云 songList.getList 使用模块级单例 _requestObj_list，并发调用会互相 cancel 对方请求，
+    // 导致所有分类都报 "Cancel Request"。手机客户端(音流/Feishin)刷新歌单列表时可能与本请求并发，
+    // 因此用 single-flight 让并发请求复用同一个进行中的 Promise，避免抢共享单例。
+    private onlinePlaylistFetching: Promise<any[]> | null = null
+
+    /**
+     * 汇总所有平台 × 分类的在线歌单，歌单名加 [分类] 前缀(与网页版分类对齐)。
+     * 网易云用 musicSdk songList.getList('hot', tag)；QQ音乐用 discovery(fetchGenres + fetchPlaylistsByGenre)。
+     * 对外入口带单飞锁；实际抓取见 _fetchOnlinePlaylistSummariesImpl。
+     */
+    private fetchOnlinePlaylistSummaries(): Promise<any[]> {
+        if (this.onlinePlaylistFetching) return this.onlinePlaylistFetching
+        this.onlinePlaylistFetching = this._fetchOnlinePlaylistSummariesImpl()
+        const p = this.onlinePlaylistFetching
+        p.finally(() => { if (this.onlinePlaylistFetching === p) this.onlinePlaylistFetching = null }).catch(() => {})
+        return p
+    }
+
+    private async _fetchOnlinePlaylistSummariesImpl(): Promise<any[]> {
+        if (global.lx.config['subsonic.onlinePlaylists'] === false) return []
+        const sources = this.getOnlineSources()
+        const perTag = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistPerTag'] || '6')) || 6))
+        const maxTags = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistMaxTags'] || '8')) || 8))
+        const cap = Math.max(1, Math.min(400, parseInt(String(global.lx.config['subsonic.onlinePlaylistCount'] || '100')) || 100))
+
+        const result: any[] = []
+        for (const source of sources) {
+            const tags: { name: string; id: string }[] = (source === 'tx' ? await this.getTxTags() : await this.getWyTags()).slice(0, maxTags)
+            // 串行抓取：网易云 songList.getList 使用单例共享 _requestObj_list，并发会互相 cancel 对方请求，
+            // 导致只剩最后一个分类存活。逐次抓取才能拿到全部分类。(QQ 源无此限制，串行亦无碍)
+            for (const tag of tags) {
+                const lists = await this.fetchPlaylistsByTag(source, tag, perTag)
+                for (const pl of lists) {
+                    const key = `${source}:${pl.id}`
+                    const displayName = `[${tag.name}] ${pl.name}`
+                    this.onlinePlaylistMeta.set(key, { tag: tag.name, displayName })
+                    result.push({
+                        id: pl.id,
+                        name: displayName,
+                        author: pl.author || tag.name,
+                        total: pl.total || 0,
+                        img: pl.img || '',
+                        source,
+                        tag: tag.name,
+                    })
+                    if (result.length >= cap) return result
+                }
+            }
+        }
+        return result
     }
 
     /**
-     * 解析在线歌单 ID，调用 musicSdk[source].songList.getListDetail 返回歌曲。
-     * 歌曲沿用现有在线播放链路(stream/getSong 按 wy_<songmid> 解析)。
+     * 解析在线歌单 ID，返回歌曲。
+     * - 网易云(wy 等): musicSdk[source].songList.getListDetail
+     * - QQ音乐(tx): discovery.fetchPlaylistSongs(与网页版发现页同源)
+     * 歌曲沿用现有在线播放链路(stream/getSong 按 <source>_<songmid> 解析)。
      */
     private async handleGetOnlinePlaylist(res: http.ServerResponse, id: string, source: string, playlistId: string, format: string) {
-        if (!musicSdk[source]?.songList?.getListDetail) {
-            return this.sendError(res, 70, `Online playlist source ${source} not supported`, format)
-        }
-
         const cacheKey = `detail_${source}_${playlistId}`
         let cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
         let musics: LX.Music.MusicInfo[]
@@ -804,22 +905,38 @@ class SubsonicHandler {
             listName = cached.name
             coverArt = cached.coverArt
         } else {
-            const detail = await musicSdk[source].songList.getListDetail(playlistId, 1)
-            listName = detail?.info?.name || '在线歌单'
-            coverArt = detail?.info?.img || 'logo'
-            const all = (detail && detail.list) || []
-            const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
-            musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, source))
+            if (source === 'tx') {
+                const detail = await fetchPlaylistSongs(playlistId)
+                listName = detail?.name || '在线歌单'
+                coverArt = 'logo'
+                const all = (detail && detail.list) || []
+                const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
+                musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, 'tx'))
+            } else {
+                if (!musicSdk[source]?.songList?.getListDetail) {
+                    return this.sendError(res, 70, `Online playlist source ${source} not supported`, format)
+                }
+                const detail = await musicSdk[source].songList.getListDetail(playlistId, 1)
+                listName = detail?.info?.name || '在线歌单'
+                coverArt = detail?.info?.img || 'logo'
+                const all = (detail && detail.list) || []
+                const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
+                musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, source))
+            }
             this.setOnlinePlaylistCache(cacheKey, { musics, name: listName, coverArt }, 10 * 60 * 1000)
         }
+
+        // 还原 [分类] 前缀展示名(与列表一致)；分类信息来自 meta 映射，缺失时退回平台原名
+        const meta = this.onlinePlaylistMeta.get(`${source}:${playlistId}`)
+        const displayName = meta?.displayName || listName
 
         // 把歌曲元数据缓存，供后续 getSong / getCoverArt / getLyrics 精准命中
         for (const m of musics) this.cacheOnlineSong(m)
 
         const playlistMeta = {
             id,
-            name: listName,
-            comment: `在线歌单 · ${source}`,
+            name: displayName,
+            comment: `在线歌单 · ${meta?.tag || source}`,
             owner: 'lxserver',
             public: false,
             songCount: musics.length,
@@ -856,6 +973,9 @@ class SubsonicHandler {
         const songmid = String(s.songmid || s.id || '')
         const sid = s.source || source
         const id = `${sid}_${songmid}`
+        const img = s.img || (s.meta && s.meta.picUrl) || ''
+        const albumName = s.albumName || (s.meta && s.meta.albumName) || ''
+        const albumId = s.albumId || (s.meta && s.meta.albumId) || ''
         return {
             id,
             name: s.name || '未知歌曲',
@@ -863,15 +983,15 @@ class SubsonicHandler {
             source: sid,
             songmid,
             interval: s.interval || 0,
-            img: s.img || '',
-            albumName: s.albumName || '',
-            albumId: s.albumId || '',
+            img,
+            albumName,
+            albumId,
             types: s.types,
             _types: s._types,
             meta: {
-                albumName: s.albumName || '',
-                albumId: s.albumId || '',
-                picUrl: s.img || '',
+                albumName,
+                albumId,
+                picUrl: img,
                 songId: songmid,
             },
         } as any

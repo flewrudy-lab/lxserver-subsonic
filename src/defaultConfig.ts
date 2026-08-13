@@ -58,9 +58,13 @@ const config: LX.Config = {
   'subsonic.onlineSearch': true, // 是否开启 Subsonic 在线全网搜索
   'subsonic.onlineSearchMode': 'fallback', // 在线搜索模式: fallback | merge | local_only
   'subsonic.onlineSearchSources': 'wy,tx,kw,kg,mg', // 在线搜索默认平台
-  'subsonic.onlinePlaylists': true, // 是否把平台在线歌单(如网易云)暴露到 Subsonic 歌单列表
-  'subsonic.onlinePlaylistSource': 'wy', // 在线歌单来源平台: wy(网易云) | tx | kw | kg | mg
-  'subsonic.onlinePlaylistCount': 20, // 歌单列表最多暴露的在线歌单数量
+  'subsonic.onlinePlaylists': true, // 是否把平台在线歌单(分类/按标签)暴露到 Subsonic 歌单列表
+  'subsonic.onlinePlaylistSources': 'wy,tx', // 暴露哪些平台的在线歌单(逗号分隔): wy(网易云) | tx(QQ音乐) | kw | kg | mg
+  'subsonic.onlinePlaylistSource': 'wy', // 单平台回退值(当 onlinePlaylistSources 未设置时生效)
+  'subsonic.onlinePlaylistTags': '', // 可选: 覆盖网易云分类(逗号分隔, 如 华语,古风,欧美)，留空用内置默认分类
+  'subsonic.onlinePlaylistMaxTags': 8, // 每个平台最多取多少个分类(标签)
+  'subsonic.onlinePlaylistPerTag': 6, // 每个分类最多暴露多少个热门歌单
+  'subsonic.onlinePlaylistCount': 100, // 歌单列表最多暴露的在线歌单总数(硬上限)
   'subsonic.onlinePlaylistSongCap': 300, // 单个在线歌单最多返回的歌曲数(防止超大 payload)
   'subsonic.lyricTranslation': true, // 是否在 Subsonic 歌词中包含翻译
   'singer.sourcePriority': ['tx', 'wy'], // 歌手信息源优先级
