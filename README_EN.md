@@ -21,6 +21,36 @@
 
 [Documentation](https://xcq0607.github.io/lxserver/) | [SyncServer](md/lxserver_EN.md) | [Changelog](changelog.md) | [中文版](README.md)
 
+> [!NOTE]
+> **This repository is a fork.** It is based on [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver) (original author **XCQ0607**). All copyright, license, and documentation of the original project belong to the original author. This repo only **adds Subsonic API enhancements** on top of it, so standard Subsonic clients like 音流 / Feishin can be used.
+> ⭐ If you like the original project, please star it on the upstream repo to support the author.
+
+### 📝 Changes in this Fork
+Extended the Subsonic protocol in `src/server/subsonic.ts` so standard music clients can:
+- **Favorite / unfavorite songs** (`star` / `unstar` → adds to the "Liked" list, persisted)
+- **Create / delete playlists** (`createPlaylist` / `deletePlaylist`)
+- **Append songs to a playlist** (`updatePlaylist?songIdToAdd=...`)
+- **Cross-source stream fallback**: automatically falls back to another available source when one fails
+- **Radio / genre garbage-entry filtering** and online song metadata completion
+
+> Full technical details: [SUBSONIC_ENHANCEMENTS.md](./SUBSONIC_ENHANCEMENTS.md).
+
+### 🚀 How to use the changes
+1. **Build & run** (same as the original):
+   ```bash
+   git clone https://github.com/flewrudy-lab/lxserver-subsonic.git
+   cd lxserver-subsonic
+   npm install
+   npm run build
+   cp config.example.js config.js   # edit password etc. as needed
+   npm start
+   ```
+2. **Connect a client**: in a Subsonic client like 音流 / Feishin, set:
+   - Server address: `http://<your-IP>:9527`
+   - Subsonic API path: default `/rest` (enabled by default on the server)
+   - Username / password: the account configured in `config.js`
+3. You can now **favorite songs, create / delete playlists, and add songs to playlists** from the client — these sync to the server's "Liked" list and user playlists.
+
 ---
 This project features a powerful built-in **Web Player**, allowing you to enjoy music anywhere in your browser. It also serves as an enhanced [LX Music Data Sync Server](md/lxserver_EN.md).
 

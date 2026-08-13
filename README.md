@@ -24,6 +24,36 @@
 
 [帮助文档 Documentation](https://xcq0607.github.io/lxserver/) | [同步服务器 SyncServer](md/lxserver.md) | [更新日志 Changelog](changelog.md) | [English](README_EN.md)
 
+> [!NOTE]
+> **本仓库是 Fork 项目。** 基于 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)（原作者 **XCQ0607**）修改而来，原项目的版权、许可证与完整文档均归原作者所有。本仓库仅在其基础上**追加了 Subsonic API 增强功能**，方便使用 音流 / Feishin 等标准 Subsonic 客户端。
+> ⭐ 如果你喜欢原项目，请到原仓库点 Star 支持原作者。
+
+### 📝 本 Fork 的修改内容
+在 `src/server/subsonic.ts` 中扩展了 Subsonic 协议，使标准音乐客户端可以：
+- **收藏 / 取消收藏歌曲**（`star` / `unstar` → 加入“我喜欢的”列表，并持久化保存）
+- **创建 / 删除歌单**（`createPlaylist` / `deletePlaylist`）
+- **向歌单追加歌曲**（`updatePlaylist?songIdToAdd=...`）
+- **跨音源播放地址兜底**：某音源失效时自动回退到其他可用音源
+- **电台 / 分类（genre）垃圾条目过滤** 与 歌曲元数据在线补全
+
+> 完整技术说明见 [SUBSONIC_ENHANCEMENTS.md](./SUBSONIC_ENHANCEMENTS.md)。
+
+### 🚀 修改内容使用方法
+1. **构建运行**（与原项目一致）：
+   ```bash
+   git clone https://github.com/flewrudy-lab/lxserver-subsonic.git
+   cd lxserver-subsonic
+   npm install
+   npm run build
+   cp config.example.js config.js   # 按需修改密码等配置
+   npm start
+   ```
+2. **客户端连接**：在 音流 / Feishin 等 Subsonic 客户端中填写：
+   - 服务器地址：`http://<你的IP>:9527`
+   - Subsonic API 路径：默认 `/rest`（已在服务端默认开启）
+   - 用户名 / 密码：即 `config.js` 中设置的账号
+3. 随后即可在客户端里**收藏歌曲、创建 / 删除歌单、向歌单添加歌曲**，这些操作会同步到服务端的“我喜欢的”列表与用户歌单。
+
 ---
 
 本项目内置了一个功能强大的 **Web 播放器**，让你可以随时随地在浏览器中享受音乐。同时，它也是一个增强版的 [LX Music 数据同步服务端](md/lxserver.md)。
