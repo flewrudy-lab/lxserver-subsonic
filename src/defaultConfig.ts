@@ -59,6 +59,9 @@ const config: LX.Config = {
   'subsonic.onlineSearchMode': 'fallback', // 在线搜索模式: fallback | merge | local_only
   'subsonic.onlineSearchSources': 'wy,tx,kw,kg,mg', // 在线搜索默认平台
   'subsonic.onlinePlaylists': true, // 是否把平台在线歌单(分类/按标签)暴露到 Subsonic 歌单列表
+  'subsonic.onlineRadio': true, // 是否把"分类电台"暴露到 Subsonic 电台列表(由在线歌单分类自动生成, 无需手改模板/ID/名称)
+  'subsonic.onlineRadioSongCap': 200, // 单个分类电台最多聚合的歌曲数(从各分类热门歌单里随机抽歌, 连续播放)
+  'subsonic.publicUrl': '', // 公网可访问地址(如 https://lx.flewrudy.pp.ua)，用于生成电台 streamUrl 等绝对链接；留空则自动用请求 Host(仅局域网可用)。手机端走隧道时必须填写，否则电台 streamUrl 指向 localhost 无法播放
   'subsonic.onlinePlaylistSources': 'wy,tx', // 暴露哪些平台的在线歌单(逗号分隔): wy(网易云) | tx(QQ音乐) | kw | kg | mg
   'subsonic.onlinePlaylistSource': 'wy', // 单平台回退值(当 onlinePlaylistSources 未设置时生效)
   'subsonic.onlinePlaylistTags': '', // 可选: 覆盖网易云分类(逗号分隔, 如 华语,古风,欧美)，留空用内置默认分类

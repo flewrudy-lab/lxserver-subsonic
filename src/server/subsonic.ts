@@ -301,7 +301,7 @@ class SubsonicHandler {
                     return this.handleGetGenres(res, username, format)
 
                 case 'getInternetRadioStations':
-                    return this.handleGetInternetRadioStations(res, format)
+                    return this.handleGetInternetRadioStations(req, res, urlObj, format)
 
                 case 'getAlbumList':
                     return this.handleGetAlbumList(res, username, params, format, false)
@@ -804,6 +804,19 @@ class SubsonicHandler {
         return genres
     }
 
+    // 根据流派名(可带 [在线] 前缀或纯分类名)查找对应的在线平台分类
+    private async findOnlineTag(nameOrId: string): Promise<{ source: string, name: string, id: string } | null> {
+        const clean = String(nameOrId || '').replace(/^\[在线\]\s*/, '').trim()
+        if (!clean) return null
+        const sources = this.getOnlineSources()
+        for (const source of sources) {
+            const tags: { name: string, id: string }[] = (source === 'tx' ? await this.getTxTags() : await this.getWyTags())
+            const hit = tags.find(t => t.name === clean)
+            if (hit) return { source, name: hit.name, id: hit.id }
+        }
+        return null
+    }
+
     // 取某分类下的热门歌单(带 TTL 缓存)
     private async fetchPlaylistsByTag(source: string, tag: { name: string; id: string }, perTag: number): Promise<any[]> {
         const cacheKey = `byTag_${source}_${tag.id}_${perTag}`
@@ -894,37 +907,15 @@ class SubsonicHandler {
      * 歌曲沿用现有在线播放链路(stream/getSong 按 <source>_<songmid> 解析)。
      */
     private async handleGetOnlinePlaylist(res: http.ServerResponse, id: string, source: string, playlistId: string, format: string) {
-        const cacheKey = `detail_${source}_${playlistId}`
-        let cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
-        let musics: LX.Music.MusicInfo[]
-        let listName: string
-        let coverArt: string
-
-        if (cached) {
-            musics = cached.musics
-            listName = cached.name
-            coverArt = cached.coverArt
-        } else {
-            if (source === 'tx') {
-                const detail = await fetchPlaylistSongs(playlistId)
-                listName = detail?.name || '在线歌单'
-                coverArt = 'logo'
-                const all = (detail && detail.list) || []
-                const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
-                musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, 'tx'))
-            } else {
-                if (!musicSdk[source]?.songList?.getListDetail) {
-                    return this.sendError(res, 70, `Online playlist source ${source} not supported`, format)
-                }
-                const detail = await musicSdk[source].songList.getListDetail(playlistId, 1)
-                listName = detail?.info?.name || '在线歌单'
-                coverArt = detail?.info?.img || 'logo'
-                const all = (detail && detail.list) || []
-                const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
-                musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, source))
-            }
-            this.setOnlinePlaylistCache(cacheKey, { musics, name: listName, coverArt }, 10 * 60 * 1000)
+        let detail
+        try {
+            detail = await this.fetchOnlinePlaylistDetail(source, playlistId)
+        } catch (e: any) {
+            return this.sendError(res, 70, `Online playlist source ${source} not supported: ${e?.message || e}`, format)
         }
+        const musics = detail.musics
+        const listName = detail.name
+        const coverArt = detail.coverArt
 
         // 还原 [分类] 前缀展示名(与列表一致)；分类信息来自 meta 映射，缺失时退回平台原名
         const meta = this.onlinePlaylistMeta.get(`${source}:${playlistId}`)
@@ -995,6 +986,110 @@ class SubsonicHandler {
                 songId: songmid,
             },
         } as any
+    }
+
+    // 取单个在线歌单的详情(歌曲列表)，带 TTL 缓存。
+    // 网易云(wy 等)用 musicSdk songList.getListDetail；QQ音乐(tx)用 discovery.fetchPlaylistSongs。
+    // 抽成独立方法，供 handleGetOnlinePlaylist 与分类电台曲库(getRadioSongPool)复用。
+    private async fetchOnlinePlaylistDetail(source: string, playlistId: string): Promise<{ musics: LX.Music.MusicInfo[], name: string, coverArt: string }> {
+        const cacheKey = `detail_${source}_${playlistId}`
+        const cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
+        if (cached) return cached
+        const cap = Math.max(1, Math.min(1000, parseInt(String(global.lx.config['subsonic.onlinePlaylistSongCap'] || '300')) || 300))
+        let musics: LX.Music.MusicInfo[]
+        let listName: string
+        let coverArt: string
+        if (source === 'tx') {
+            const detail = await fetchPlaylistSongs(playlistId)
+            listName = detail?.name || '在线歌单'
+            coverArt = 'logo'
+            const all = (detail && detail.list) || []
+            musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, 'tx'))
+        } else {
+            if (!musicSdk[source]?.songList?.getListDetail) {
+                throw new Error(`source ${source} not supported`)
+            }
+            const detail = await musicSdk[source].songList.getListDetail(playlistId, 1)
+            listName = detail?.info?.name || '在线歌单'
+            coverArt = detail?.info?.img || 'logo'
+            const all = (detail && detail.list) || []
+            musics = all.slice(0, cap).map((s: any) => this.buildOnlineMusic(s, source))
+        }
+        const out = { musics, name: listName, coverArt }
+        this.setOnlinePlaylistCache(cacheKey, out, 10 * 60 * 1000)
+        return out
+    }
+
+    // ─────────────────────────────────────────────
+    // [分类电台] 由在线歌单分类自动生成的"电台模式"
+    // 每个分类(如 华语)聚合成一个电台，播放时随机抽一首歌 302 跳转，实现连续随机播放。
+    // 电台 ID 由分类名 base64url 生成，完全自动 —— 用户无需手改任何模板/ID/名称。
+    // 同时支持网易云(wy)与 QQ音乐(tx)；与官方 QQ 电台(纯数字 radio_tx_xxx)互不冲突。
+    // ─────────────────────────────────────────────
+
+    private isOnlineRadioEnabled(): boolean {
+        if (global.lx.config['subsonic.onlineRadio'] === false) return false
+        if (global.lx.config['subsonic.onlinePlaylists'] === false) return false
+        return true
+    }
+
+    // 解析分类电台 ID: radio_(wy|tx)_<base64url(JSON{n,i})>
+    // n=分类名(用于展示与网易云 cat), i=平台分类 ID(QQ 需要数字 genre id, 网易云 n===i)
+    // 纯数字 tail 视为官方 QQ 电台(radio_tx_123)，不在此解析，保持原逻辑。
+    private parseCategoryRadio(id: string): { source: string, name: string, id: string } | null {
+        const m = /^radio_(wy|tx)_(.+)$/.exec(id)
+        if (!m) return null
+        const tail = m[2]
+        if (/^\d+$/.test(tail)) return null
+        try {
+            const obj = JSON.parse(Buffer.from(tail, 'base64url').toString('utf8'))
+            if (!obj || typeof obj.n !== 'string' || !obj.n) return null
+            return { source: m[1], name: obj.n, id: String(obj.i != null ? obj.i : obj.n) }
+        } catch {
+            return null
+        }
+    }
+
+    private buildCategoryRadioPseudoTrack(id: string): LX.Music.MusicInfo | null {
+        const parsed = this.parseCategoryRadio(id)
+        if (!parsed) return null
+        const sourceName = parsed.source === 'wy' ? '网易云' : 'QQ音乐'
+        return {
+            id,
+            name: `[电台] ${parsed.name}`,
+            singer: `${sourceName}电台`,
+            source: parsed.source,
+            songmid: '',
+            interval: 0,
+            img: '',
+            meta: { albumName: '分类电台', picUrl: '' },
+        } as any
+    }
+
+    // 聚合某分类下所有热门歌单的歌曲，作为电台随机曲库(带 TTL 缓存)
+    private async getRadioSongPool(source: string, tagName: string, tagId: string): Promise<LX.Music.MusicInfo[]> {
+        const cacheKey = `radio_${source}_${tagName}_${tagId}`
+        const cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
+        if (cached && cached.length) return cached
+        const perTag = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistPerTag'] || '6')) || 6))
+        const cap = Math.max(1, Math.min(500, parseInt(String(global.lx.config['subsonic.onlineRadioSongCap'] || '200')) || 200))
+        const lists = await this.fetchPlaylistsByTag(source, { name: tagName, id: tagId }, perTag)
+        const pool: LX.Music.MusicInfo[] = []
+        for (const pl of lists) {
+            try {
+                const detail = await this.fetchOnlinePlaylistDetail(source, pl.id)
+                for (const s of detail.musics) {
+                    if (pool.length >= cap) break
+                    pool.push(s)
+                }
+            } catch (e) {
+                console.error(`[Subsonic] radio pool fetch ${source}/${tagName}/${pl.id} failed:`, e)
+            }
+            if (pool.length >= cap) break
+        }
+        // 仅缓存非空曲库，避免失败/空结果污染缓存(否则同分类名的不同 id 编码会共享空缓存)
+        if (pool.length > 0) this.setOnlinePlaylistCache(cacheKey, pool, 10 * 60 * 1000)
+        return pool
     }
 
     private async handleUpdatePlaylist(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
@@ -1130,25 +1225,45 @@ class SubsonicHandler {
                     }
                 }
             */
-        } else if (id.startsWith('radio_tx_')) {
-            // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
-            const radioId = id.replace('radio_tx_', '')
-            try {
-                const radioName = await this.getRadioName(radioId)
-                listName = radioName
-                musics = [ this.buildRadioPseudoTrack(radioId, radioName) ]
-            } catch (e) {
-                console.error(`[Subsonic] Resolve radio name failed:`, e)
+        } else if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
+            // 先判断是否为"分类电台"(由在线歌单分类自动生成)；否则走官方 QQ 电台(纯数字 ID)
+            const catRadio = this.buildCategoryRadioPseudoTrack(id)
+            if (catRadio) {
+                listName = catRadio.name
+                musics = [catRadio]
+            } else {
+                // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
+                const radioId = id.replace('radio_tx_', '')
+                try {
+                    const radioName = await this.getRadioName(radioId)
+                    listName = radioName
+                    musics = [ this.buildRadioPseudoTrack(radioId, radioName) ]
+                } catch (e) {
+                    console.error(`[Subsonic] Resolve radio name failed:`, e)
+                }
             }
-        } else if (id.startsWith('alb_tx_playlist_')) {
-            // [新增] 处理虚拟出的歌单详情
-            const dissid = id.replace('alb_tx_playlist_', '')
+        } else if (id.includes('_playlist_')) {
+            // [新增] 在线歌单作为专辑(由 流派/byGenre 生成): alb_<source>_playlist_<id>
+            const marker = '_playlist_'
+            const idx = id.indexOf(marker)
+            const source = id.slice(4, idx) // 去掉前缀 'alb_'
+            const dissid = id.slice(idx + marker.length)
             try {
-                const result = await fetchPlaylistSongs(dissid)
-                listName = result.name
-                musics = result.list as any
+                let list: any[] = []
+                let name = '在线歌单'
+                if (source === 'tx') {
+                    const result = await fetchPlaylistSongs(dissid)
+                    list = (result && result.list) || []
+                    name = (result && result.name) || name
+                } else if (musicSdk[source]?.songList?.getListDetail) {
+                    const result = await musicSdk[source].songList.getListDetail(dissid, 1)
+                    list = (result && result.list) || []
+                    name = (result && result.info && result.info.name) || name
+                }
+                listName = name
+                musics = list.map((s: any) => ({ ...s, id: `${source}_${s.songmid || s.songId}`, source }))
             } catch (e) {
-                console.error(`[Subsonic] Fetch playlist detail failed:`, e)
+                console.error(`[Subsonic] Fetch online playlist album ${id} failed:`, e)
             }
         } else if (id.startsWith('alb_')) {
             // [新增] 处理来自 SDK 的专辑详情
@@ -1293,7 +1408,15 @@ class SubsonicHandler {
         let music: LX.Music.MusicInfo | null = null
         let listId = 'online'
 
-        if (id.startsWith('radio_tx_')) {
+        if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
+            const catRadio = this.buildCategoryRadioPseudoTrack(id)
+            if (catRadio) {
+                if (format === 'json') {
+                    return this.sendResponse(res, { song: this.musicToSongFlat(catRadio, id) }, format)
+                }
+                return this.sendResponse(res, { song: this.musicToSongXml(catRadio, id) }, format)
+            }
+            // 官方 QQ 电台(纯数字 ID)
             const radioId = id.replace('radio_tx_', '')
             const radioName = await this.getRadioName(radioId)
             const radioMusic = this.buildRadioPseudoTrack(radioId, radioName)
@@ -1416,15 +1539,21 @@ class SubsonicHandler {
         let musics: LX.Music.MusicInfo[] = []
         let dirName = 'Unknown'
 
-        if (id.startsWith('radio_tx_')) {
-            // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
-            const radioId = id.replace('radio_tx_', '')
-            try {
-                const radioName = await this.getRadioName(radioId)
-                dirName = radioName
-                musics = [ this.buildRadioPseudoTrack(radioId, radioName) ]
-            } catch (e) {
-                console.error(`[Subsonic] Resolve radio name failed:`, e)
+        if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
+            const catRadio = this.buildCategoryRadioPseudoTrack(id)
+            if (catRadio) {
+                dirName = catRadio.name
+                musics = [catRadio]
+            } else {
+                // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
+                const radioId = id.replace('radio_tx_', '')
+                try {
+                    const radioName = await this.getRadioName(radioId)
+                    dirName = radioName
+                    musics = [ this.buildRadioPseudoTrack(radioId, radioName) ]
+                } catch (e) {
+                    console.error(`[Subsonic] Resolve radio name failed:`, e)
+                }
             }
         } else if (id === 'love') {
             musics = listData.loveList
@@ -1477,15 +1606,36 @@ class SubsonicHandler {
             try {
                 if (type === 'byGenre') {
                     const genreNameOrId = params.get('genre') || ''
-                    // 尝试从 fetchGenres 中寻找 ID (如果传入的是名称)
-                    let categoryId = genreNameOrId
-                    if (isNaN(parseInt(genreNameOrId))) {
-                        const genres = await fetchGenres()
-                        const target = genres.find(g => g.value === genreNameOrId)
-                        if (target) categoryId = target.id
-                    }
-                    if (categoryId) {
-                        albums = await fetchPlaylistsByGenre(categoryId, size)
+                    // [新增] 在线流派: 返回该分类下的在线歌单(作为专辑)，点开即播放其歌曲(走已验证的 stream 路径)
+                    const onlineTag = await this.findOnlineTag(genreNameOrId)
+                    if (onlineTag) {
+                        const perTag = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistPerTag'] || '6')) || 6))
+                        const lists = await this.fetchPlaylistsByTag(onlineTag.source, onlineTag, perTag)
+                        albums = lists.map((pl: any) => ({
+                            id: `alb_${onlineTag.source}_playlist_${pl.id}`,
+                            name: pl.name,
+                            title: pl.name,
+                            album: pl.name,
+                            artist: onlineTag.name,
+                            artistId: `genre_${onlineTag.name}`,
+                            isDir: true,
+                            coverArt: pl.img || `alb_${onlineTag.source}_playlist_${pl.id}`,
+                            songCount: pl.total || 0,
+                            duration: 0,
+                            created: new Date().toISOString(),
+                            playCount: 0,
+                        }))
+                    } else {
+                        // 尝试从 fetchGenres 中寻找 ID (如果传入的是名称)
+                        let categoryId = genreNameOrId
+                        if (isNaN(parseInt(genreNameOrId))) {
+                            const genres = await fetchGenres()
+                            const target = genres.find(g => g.value === genreNameOrId)
+                            if (target) categoryId = target.id
+                        }
+                        if (categoryId) {
+                            albums = await fetchPlaylistsByGenre(categoryId, size)
+                        }
                     }
                 } else {
                     const recommendations = await fetchRecommendedAlbums(type, size)
@@ -1774,20 +1924,77 @@ class SubsonicHandler {
 
     private async handleGetGenres(res: http.ServerResponse, username: string, format: string) {
         const genres = await fetchGenres()
-        // console.log(`[Subsonic] handleGetGenres found ${genres.length} genres`)
+        const out: any[] = [...genres]
+        // [新增] 把在线歌单分类(华语/欧美/古风…)也作为流派暴露，前缀 [在线] 以便与本地曲库流派区分
+        if (global.lx.config['subsonic.onlinePlaylists'] !== false) {
+            const sources = this.getOnlineSources()
+            for (const source of sources) {
+                const tags: { name: string, id: string }[] = (source === 'tx' ? await this.getTxTags() : await this.getWyTags())
+                for (const tag of tags) {
+                    out.push({ value: `[在线] ${tag.name}`, id: `online_${source}_${tag.id}`, songCount: 0, albumCount: 0 })
+                }
+            }
+        }
         if (format === 'json') {
-            return this.sendResponse(res, { genres: { genre: genres } }, format)
+            return this.sendResponse(res, { genres: { genre: out } }, format)
         }
         return this.sendResponse(res, {
             genres: {
                 children: {
-                    genre: genres.map(g => ({ attrs: { songCount: g.songCount, albumCount: g.albumCount }, children: g.value }))
+                    genre: out.map(g => ({ attrs: { songCount: g.songCount, albumCount: g.albumCount }, children: g.value }))
                 }
             }
         }, format)
     }
 
-    private async handleGetInternetRadioStations(res: http.ServerResponse, format: string) {
+    private async handleGetInternetRadioStations(req: http.IncomingMessage, res: http.ServerResponse, urlObj: URL, format: string) {
+        // [分类电台] 开启时，自动生成 网易云/QQ音乐 各分类电台，覆盖原来需要登录 Cookie 才能播的官方电台
+        if (this.isOnlineRadioEnabled()) {
+            const sources = this.getOnlineSources()
+            const stations: any[] = []
+            const proto = ((req.headers['x-forwarded-proto'] as string)
+                || (req.socket && (req.socket as any).encrypted ? 'https' : 'http')
+                || 'http') as string
+            // [修复] 电台 streamUrl 必须是手机端可达的公网地址。优先用配置的 subsonic.publicUrl，
+            // 否则回退到请求 Host(仅局域网可用)。写死 localhost 会导致手机端(走隧道)无法播放电台。
+            const cfgPublic = String(global.lx.config['subsonic.publicUrl'] || '').trim()
+            let base: string
+            if (cfgPublic) {
+                base = cfgPublic.replace(/\/+$/, '')
+                if (!/^https?:\/\//i.test(base)) base = `${proto}://${base}`
+            } else {
+                const host = ((req.headers['x-forwarded-host'] as string) || (req.headers['host'] as string) || '') as string
+                base = `${proto}://${host}`
+            }
+            // [修复] 用配置的 subsonic.path 规范生成 stream 路径，避免客户端把 base 配成含 /rest 时
+            // 把请求路径变成 /rest/rest/... 进而污染 streamUrl(导致手机端电台地址出现双 /rest 无法播放)
+            const subsonicPath = (String(global.lx.config['subsonic.path'] || '/rest')).replace(/\/+$/, '') || '/rest'
+            const streamPath = `${subsonicPath}/stream.view`
+            for (const source of sources) {
+                const tags = (source === 'tx' ? await this.getTxTags() : await this.getWyTags())
+                const sourceName = source === 'wy' ? '网易云' : 'QQ音乐'
+                for (const tag of tags) {
+                    const enc = Buffer.from(JSON.stringify({ n: tag.name, i: tag.id }), 'utf8').toString('base64url')
+                    const id = `radio_${source}_${enc}`
+                    const streamUrl = `${base}${streamPath}?id=${encodeURIComponent(id)}`
+                    stations.push({
+                        id,
+                        name: `[电台] ${sourceName}·${tag.name}`,
+                        streamUrl,
+                        homePageUrl: '',
+                    })
+                }
+            }
+            if (format === 'json') {
+                return this.sendResponse(res, { internetRadioStations: { internetRadioStation: stations } }, format)
+            }
+            return this.sendResponse(res, {
+                internetRadioStations: {
+                    children: { internetRadioStation: stations.map(r => ({ attrs: r })) }
+                }
+            }, format)
+        }
+        // 兜底: 关闭分类电台时，返回官方电台(需 QQ 登录 Cookie 才能播)
         const radios = await fetchRadios()
         if (format === 'json') {
             return this.sendResponse(res, { internetRadioStations: { internetRadioStation: radios } }, format)
@@ -2313,6 +2520,36 @@ class SubsonicHandler {
 
         // [新增] 如果带了 genre 参数，则优先从云端拉取该流派的歌曲
         if (genreNameOrId) {
+            // [新增] 在线流派: 从在线歌单分类(华语/欧美…)里取歌，每首 id=wy_xxx/tx_xxx 走已验证的 stream 路径
+            const onlineTag = await this.findOnlineTag(genreNameOrId)
+            if (onlineTag) {
+                try {
+                    const perTag = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistPerTag'] || '6')) || 6))
+                    const cap = Math.max(1, Math.min(500, parseInt(String(global.lx.config['subsonic.onlineRadioSongCap'] || '200')) || 200))
+                    const lists = await this.fetchPlaylistsByTag(onlineTag.source, onlineTag, perTag)
+                    const songs: any[] = []
+                    for (const pl of lists) {
+                        try {
+                            const detail = await this.fetchOnlinePlaylistDetail(onlineTag.source, pl.id)
+                            for (const s of (detail && detail.musics) || []) {
+                                if (songs.length >= cap) break
+                                this.cacheOnlineSong(s)
+                                songs.push(s)
+                            }
+                        } catch (e) {
+                            console.error(`[Subsonic] online genre pool ${onlineTag.source}/${onlineTag.name}/${pl.id} failed:`, e)
+                        }
+                        if (songs.length >= cap) break
+                    }
+                    if (songs.length > 0) {
+                        const parentId = `genre_${onlineTag.name}`
+                        return this.renderRandomSongs(res, songs.map(m => ({ music: m, listId: parentId })), format, rootKey)
+                    }
+                } catch (e) {
+                    console.error(`[Subsonic] online genre fetch failed:`, e)
+                }
+            }
+            // 原有本地流派逻辑
             try {
                 let categoryId = genreNameOrId
                 if (isNaN(parseInt(genreNameOrId))) {
@@ -2456,7 +2693,26 @@ class SubsonicHandler {
                 quality = '320k'
             }
 
-            // [新增] 处理电台流: 随机取一首歌播放
+            // [分类电台] 由在线歌单分类自动生成: 随机抽一首歌 302 跳转，实现连续随机播放
+            if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
+                const parsed = this.parseCategoryRadio(id)
+                if (parsed) {
+                    const pool = await this.getRadioSongPool(parsed.source, parsed.name, parsed.id)
+                    if (pool.length > 0) {
+                        const s = pool[Math.floor(Math.random() * pool.length)]
+                        const songmid = s.songmid
+                        const musicInfo: any = { source: parsed.source, songmid, id: `${parsed.source}_${songmid}`, meta: { songId: songmid } }
+                        const result = await callUserApiGetMusicUrl(parsed.source as any, musicInfo, quality, username)
+                        if (result && result.url) {
+                            res.writeHead(302, { Location: result.url })
+                            return res.end()
+                        }
+                    }
+                    return this.sendError(res, 0, 'Could not resolve radio track', format)
+                }
+            }
+
+            // [新增] 处理官方电台流: 随机取一首歌播放
             if (id.startsWith('radio_tx_')) {
                 const radioId = id.replace('radio_tx_', '')
                 // console.log(`[Subsonic] Radio stream requested: ${id}`)

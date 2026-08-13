@@ -231,6 +231,23 @@ declare namespace LX {
     'subsonic.onlinePlaylists'?: boolean
 
     /**
+     * 是否把"分类电台"暴露到 Subsonic 电台列表 (默认 true)。
+     * 电台完全由在线歌单的分类(华语/古风/欧美…)自动生成，用户无需手改任何模板、ID 或名称。
+     */
+    'subsonic.onlineRadio'?: boolean
+
+    /**
+     * 单个分类电台最多聚合的歌曲数(从这些分类下的热门歌单里随机抽歌，实现连续随机播放)，默认 200
+     */
+    'subsonic.onlineRadioSongCap'?: number
+
+    /**
+     * 公网可访问地址(如 https://lx.flewrudy.pp.ua)，用于生成电台 streamUrl 等绝对链接。
+     * 留空则自动用请求 Host(仅局域网可用)。手机端走隧道/cloudflare 时必须填写，否则电台 streamUrl 指向 localhost 无法播放。
+     */
+    'subsonic.publicUrl'?: string
+
+    /**
      * 暴露哪些平台的在线歌单(逗号分隔): wy(网易云) | tx(QQ音乐) | kw | kg | mg，默认 'wy,tx'
      */
     'subsonic.onlinePlaylistSources'?: string
