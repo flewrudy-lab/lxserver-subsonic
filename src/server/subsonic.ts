@@ -251,11 +251,15 @@ class SubsonicHandler {
         const logQuery = params.get('query')
         const logArtist = params.get('artist')
         const logTitle = params.get('title')
+        const logGenre = params.get('genre')
+        const logType = params.get('type')
         let logDetails = `user=${username}`
         if (logId) logDetails += ` id=${logId}`
         if (logQuery) logDetails += ` query="${logQuery}"`
         if (logArtist) logDetails += ` artist="${logArtist}"`
         if (logTitle) logDetails += ` title="${logTitle}"`
+        if (logGenre) logDetails += ` genre="${logGenre}"`
+        if (logType) logDetails += ` type=${logType}`
 
         if (global.lx.config['subsonic.enableDebug']) {
             console.log(`[Subsonic Debug] ${req.method} /${method} (${format}) ${logDetails}`)
@@ -806,12 +810,30 @@ class SubsonicHandler {
 
     // 根据流派名(可带 [在线] 前缀或纯分类名)查找对应的在线平台分类
     private async findOnlineTag(nameOrId: string): Promise<{ source: string, name: string, id: string } | null> {
-        const clean = String(nameOrId || '').replace(/^\[在线\]\s*/, '').trim()
+        if (!nameOrId) return null
+        // 支持多种传入形式:
+        //   1) id 形式: online_wy_100 / online_tx_xxx
+        //   2) source:id 形式: wy:100 / tx:xxx (部分客户端会这样编码)
+        //   3) 带 [在线] 前缀的展示名: [在线] 华语
+        //   4) 裸分类名: 华语
+        let sourceHint: string | null = null
+        let clean = String(nameOrId).trim()
+        const idMatch = /^online_(wy|tx)_(.+)$/.exec(clean)
+        if (idMatch) {
+            sourceHint = idMatch[1]
+            clean = idMatch[2]
+        }
+        const scMatch = /^(wy|tx):(.+)$/.exec(clean)
+        if (scMatch) {
+            sourceHint = scMatch[1]
+            clean = scMatch[2]
+        }
+        clean = clean.replace(/^\[在线\]\s*/, '').trim()
         if (!clean) return null
-        const sources = this.getOnlineSources()
+        const sources = sourceHint ? [sourceHint] : this.getOnlineSources()
         for (const source of sources) {
             const tags: { name: string, id: string }[] = (source === 'tx' ? await this.getTxTags() : await this.getWyTags())
-            const hit = tags.find(t => t.name === clean)
+            const hit = tags.find(t => t.name === clean || String(t.id) === clean)
             if (hit) return { source, name: hit.name, id: hit.id }
         }
         return null
@@ -2495,7 +2517,7 @@ class SubsonicHandler {
                 songmid,
                 interval: '0',
                 meta: { songId: songmid },
-            } as LX.Music.MusicInfo
+            } as unknown as LX.Music.MusicInfo
         }
         return null
     }
@@ -2613,6 +2635,29 @@ class SubsonicHandler {
         const id = params.get('id')
         const count = Math.min(parseInt(params.get('count') || '10'), 50)
 
+        // [修复] 音流(及多数客户端)把电台当"相似歌曲"种子来构建播放队列:
+        // 点开电台会调用 getSimilarSongs?id=radio_xx。原先这段代码只认本地库 id，
+        // 对 radio id 返回的是本地随机歌曲(甚至 kw_ 等无法解析的)，导致电台打不开/不出声。
+        // 这里对分类电台 id 返回该分类真实的在线歌曲池。
+        if (id && (id.startsWith('radio_wy_') || id.startsWith('radio_tx_'))) {
+            const parsed = this.parseCategoryRadio(id)
+            if (parsed) {
+                try {
+                    const pool = await this.getRadioSongPool(parsed.source, parsed.name, parsed.id)
+                    if (pool.length > 0) {
+                        const parentId = id
+                        const picked = pool.slice(0, Math.max(count, Math.min(pool.length, 50)))
+                        for (const m of picked) this.cacheOnlineSong(m)
+                        return this.renderRandomSongs(res, picked.map(m => ({ music: m, listId: parentId })), format, useV2 ? 'similarSongs2' : 'similarSongs')
+                    }
+                } catch (e: any) {
+                    console.error(`[Subsonic] radio similarSongs pool failed for ${id}:`, e?.message || e)
+                }
+            }
+            // 解析失败或池为空：返回空列表，避免把本地随机歌曲伪装成电台
+            return this.renderRandomSongs(res, [], format, useV2 ? 'similarSongs2' : 'similarSongs')
+        }
+
         const userSpace = getUserSpace(username)
         const listData = await userSpace.listManage.getListData()
 
@@ -2700,7 +2745,7 @@ class SubsonicHandler {
                     const pool = await this.getRadioSongPool(parsed.source, parsed.name, parsed.id)
                     if (pool.length > 0) {
                         const s = pool[Math.floor(Math.random() * pool.length)]
-                        const songmid = s.songmid
+                        const songmid = (s as any).songmid
                         const musicInfo: any = { source: parsed.source, songmid, id: `${parsed.source}_${songmid}`, meta: { songId: songmid } }
                         const result = await callUserApiGetMusicUrl(parsed.source as any, musicInfo, quality, username)
                         if (result && result.url) {
