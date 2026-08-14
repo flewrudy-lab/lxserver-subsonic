@@ -1070,6 +1070,16 @@ class SubsonicHandler {
         return true
     }
 
+    // 生成 [0,n) 的随机打乱索引数组(Fisher-Yates)，用于电台随机抽取若干首试播
+    private shuffleIndices(n: number): number[] {
+        const arr = Array.from({ length: n }, (_, i) => i)
+        for (let i = n - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1))
+            ;[arr[i], arr[j]] = [arr[j], arr[i]]
+        }
+        return arr
+    }
+
     // 解析分类电台 ID: radio_(wy|tx)_<base64url(JSON{n,i})>
     // n=分类名(用于展示与网易云 cat), i=平台分类 ID(QQ 需要数字 genre id, 网易云 n===i)
     // 纯数字 tail 视为官方 QQ 电台(radio_tx_123)，不在此解析，保持原逻辑。
@@ -1211,6 +1221,100 @@ class SubsonicHandler {
         return this.sendResponse(res, {}, format)
     }
 
+    // 解析专辑 id 的曲目列表，供 handleGetAlbum 与 handleGetMusicDirectory(OpenSubsonic 浏览) 共用。
+    // 覆盖: 在线歌单专辑(alb_<source>_playlist_<id>)、SDK 平台专辑(alb_<source>_<id>)、
+    // 聚合专辑(album_)、以及把单首歌 id 当专辑 id 查的动态情形。
+    private async resolveAlbumMusics(username: string, id: string): Promise<{ musics: LX.Music.MusicInfo[], name: string, albumPublishTime?: string }> {
+        const userSpace = getUserSpace(username)
+        const listData = await userSpace.listManage.getListData()
+
+        let musics: LX.Music.MusicInfo[] = []
+        let name = 'Unknown'
+        let albumPublishTime: string | undefined
+
+        if (id.startsWith('lib-alb_')) {
+            const realId = id.replace('lib-alb_', '')
+            const libAlbums = await this.getLibraryData(username, 'albums')
+            const album = libAlbums.find((a: any) => String(a.id) === realId || String(a.meta?.albumId) === realId)
+            if (album) {
+                name = album.name
+                albumPublishTime = album.publishTime
+                musics = (album.list || []).map((s: any) => ({
+                    id: `${s.source}_${s.songmid || s.songId}`,
+                    name: s.name, singer: s.singer, source: s.source, songmid: s.songmid,
+                    interval: s.interval || '0', img: s.img,
+                    meta: { picUrl: s.img, albumName: s.albumName || album.name, albumId: s.albumMid || album.id },
+                } as any))
+            }
+        } else if (id.includes('_playlist_')) {
+            // 在线歌单专辑(流派 byGenre 生成)
+            const marker = '_playlist_'
+            const idx = id.indexOf(marker)
+            const source = id.slice(4, idx)
+            const dissid = id.slice(idx + marker.length)
+            try {
+                const detail = await this.fetchOnlinePlaylistDetail(source, dissid)
+                musics = detail.musics
+                name = detail.name
+            } catch (e: any) {
+                console.error(`[Subsonic] resolveAlbumMusics playlist ${id} failed:`, e?.message || e)
+            }
+        } else if (id.startsWith('alb_')) {
+            const parts = id.split('_')
+            const source = parts[1]
+            const realId = parts.slice(2).join('_')
+            if (musicSdk[source]?.extendDetail?.getAlbumSongs) {
+                try {
+                    const data = await musicSdk[source].extendDetail.getAlbumSongs(realId)
+                    musics = (data.list || []).map((s: any) => ({ ...s, id: `${source}_${s.songmid || s.songId}`, source }))
+                    name = data.name || (musics[0] as any)?.albumName || (musics[0] as any)?.meta?.albumName || 'Album Detail'
+                    albumPublishTime = data.publishTime
+                } catch (e: any) {
+                    console.error(`[Subsonic] resolveAlbumMusics SDK ${id} failed:`, e?.message)
+                }
+            }
+        } else if (id.startsWith('album_')) {
+            const allMusicsMap = new Map<string, { music: LX.Music.MusicInfo }[]>()
+            const collectInto = (songs: LX.Music.MusicInfo[]) => {
+                for (const m of songs) {
+                    const albumName = (m as any).meta?.albumName || m.name
+                    const singer = m.singer || 'Unknown'
+                    const key = `album_${Buffer.from(`${albumName}__${singer}`).toString('base64url').slice(0, 24)}`
+                    if (!allMusicsMap.has(key)) allMusicsMap.set(key, [])
+                    allMusicsMap.get(key)!.push({ music: m })
+                }
+            }
+            collectInto(listData.loveList)
+            collectInto(listData.defaultList)
+            for (const list of listData.userList) collectInto((list.list || []) as LX.Music.MusicInfo[])
+            const entries = allMusicsMap.get(id) || []
+            musics = entries.map(e => e.music)
+            if (musics.length > 0) name = (musics[0] as any).meta?.albumName || musics[0].name
+        } else if (id.includes('_')) {
+            const found = await this.findMusicById(username, id)
+            if (found) {
+                musics = [found.music]
+                name = found.music.name
+            } else {
+                const parts = id.split('_')
+                const source = parts[0]
+                const songmid = parts.slice(1).join('_')
+                if (musicSdk[source]) {
+                    musics = [{ id, name: 'Unknown', singer: 'Unknown', source, songmid, interval: '0' } as any]
+                    name = 'Single Album'
+                }
+            }
+        } else {
+            const list = listData.userList.find((l: any) => l.id === id)
+            if (list) {
+                name = list.name
+                musics = (list.list || []) as LX.Music.MusicInfo[]
+            }
+        }
+
+        return { musics, name, albumPublishTime }
+    }
+
     // getAlbum: 返回 album + song[] 格式（音流等客户端期望的格式）
     private async handleGetAlbum(res: http.ServerResponse, username: string, params: URLSearchParams, format: string) {
         const id = params.get('id')
@@ -1223,77 +1327,13 @@ class SubsonicHandler {
         let listName = 'Unknown'
         let albumPublishTime: string | undefined
 
-        if (id === 'love') {
-            musics = listData.loveList
-            listName = '我的收藏'
-        } else if (id === 'default') {
-            musics = listData.defaultList
-            listName = '默认列表'
-        } else if (id.startsWith('lib-alb_')) {
-            // 从本地收藏专辑库获取详情，将原始歌曲字段规范化为标准格式
-            const realId = id.replace('lib-alb_', '')
-            const libAlbums = await this.getLibraryData(username, 'albums')
-            const album = libAlbums.find((a: any) => String(a.id) === realId || String(a.meta?.albumId) === realId)
-            if (album) {
-                listName = album.name
-                albumPublishTime = album.publishTime
-                // library 歌曲是原始字段，需要映射成 MusicInfo 兼容格式
-                musics = (album.list || []).map((s: any) => ({
-                    id: `${s.source}_${s.songmid || s.songId}`,
-                    name: s.name,
-                    singer: s.singer,
-                    source: s.source,
-                    songmid: s.songmid,
-                    interval: s.interval || '0',
-                    img: s.img,
-                    meta: {
-                        picUrl: s.img,
-                        albumName: s.albumName || album.name,
-                        albumId: s.albumMid || album.id,
-                    },
-                } as any))
-            }
-            /* 
-            } else if (id.startsWith('alb_hot_')) {
-                // [新增] 处理虚拟出的歌手热门歌曲专辑
-                const fullArtId = id.replace('alb_hot_', '')
-                let source = 'wy'
-                let artistId = fullArtId
-                if (fullArtId.startsWith('art_')) {
-                    const parts = fullArtId.split('_')
-                    source = parts[1]
-                    artistId = parts.slice(2).join('_')
-                }
-                if (musicSdk[source]?.extendDetail) {
-                    try {
-                        // [修改] 统一使用 5 页 (500 首) 循环抓取
-                        const MAX_PAGES = 5
-                        const PAGE_SIZE = 100
-                        let all: any[] = []
-                        for (let p = 1; p <= MAX_PAGES; p++) {
-                            const data = await musicSdk[source].extendDetail.getArtistSongs(artistId, p, PAGE_SIZE, 'hot')
-                            const pageList = data.list || []
-                            all = all.concat(pageList)
-                            if (pageList.length < PAGE_SIZE) break
-                        }
-                        musics = all.map((s: any) => ({
-                            ...s,
-                            id: `${source}_${s.songmid || s.songId}`
-                        }))
-                        listName = '热门歌曲'
-                    } catch (e) {
-                        console.error(`[Subsonic] SDK getArtistSongs (for virtual album) error:`, e)
-                    }
-                }
-            */
-        } else if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
-            // 先判断是否为"分类电台"(由在线歌单分类自动生成)；否则走官方 QQ 电台(纯数字 ID)
+        if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
+            // 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
             const catRadio = this.buildCategoryRadioPseudoTrack(id)
             if (catRadio) {
                 listName = catRadio.name
                 musics = [catRadio]
             } else {
-                // [修改] 电台作为"电台站"整体返回，不再展开成单曲列表，避免客户端把随机歌曲记进最近播放
                 const radioId = id.replace('radio_tx_', '')
                 try {
                     const radioName = await this.getRadioName(radioId)
@@ -1303,97 +1343,13 @@ class SubsonicHandler {
                     console.error(`[Subsonic] Resolve radio name failed:`, e)
                 }
             }
-        } else if (id.includes('_playlist_')) {
-            // [新增] 在线歌单作为专辑(由 流派/byGenre 生成): alb_<source>_playlist_<id>
-            const marker = '_playlist_'
-            const idx = id.indexOf(marker)
-            const source = id.slice(4, idx) // 去掉前缀 'alb_'
-            const dissid = id.slice(idx + marker.length)
-            try {
-                let list: any[] = []
-                let name = '在线歌单'
-                if (source === 'tx') {
-                    const result = await fetchPlaylistSongs(dissid)
-                    list = (result && result.list) || []
-                    name = (result && result.name) || name
-                } else if (musicSdk[source]?.songList?.getListDetail) {
-                    const result = await musicSdk[source].songList.getListDetail(dissid, 1)
-                    list = (result && result.list) || []
-                    name = (result && result.info && result.info.name) || name
-                }
-                listName = name
-                musics = list.map((s: any) => ({ ...s, id: `${source}_${s.songmid || s.songId}`, source }))
-            } catch (e) {
-                console.error(`[Subsonic] Fetch online playlist album ${id} failed:`, e)
-            }
-        } else if (id.startsWith('alb_')) {
-            // [新增] 处理来自 SDK 的专辑详情
-            const parts = id.split('_')
-            const source = parts[1]
-            const realId = parts.slice(2).join('_')
-            // console.log(`[Subsonic] getAlbum SDK Route: source=${source}, realId=${realId}`)
-
-            if (musicSdk[source]?.extendDetail?.getAlbumSongs) {
-                try {
-                    const data = await musicSdk[source].extendDetail.getAlbumSongs(realId)
-                    // console.log(`[Subsonic] getAlbum SDK Response: name=${data?.name}, songCount=${data?.list?.length}`)
-                    musics = (data.list || []).map((s: any) => ({
-                        ...s,
-                        id: `${source}_${s.songmid || s.songId}`,
-                        source
-                    }))
-                    // [优化] 如果数据里没带专辑名，从第一首歌里提取
-                    listName = data.name || (musics[0] as any)?.albumName || (musics[0] as any)?.meta?.albumName || 'Album Detail'
-                    albumPublishTime = data.publishTime
-                } catch (e: any) {
-                    console.error(`[Subsonic] SDK getAlbumSongs error for ${id}:`, e?.message)
-                }
-            } else {
-                console.warn(`[Subsonic] SDK missing extendDetail.getAlbumSongs for ${source}`)
-            }
-        } else if (id.startsWith('album_')) {
-            // 聚合专辑 ID（由 getAlbumList/getAlbumList2 生成）
-            const allMusicsMap = new Map<string, { music: LX.Music.MusicInfo, listId: string }[]>()
-            const collectInto = (songs: LX.Music.MusicInfo[], listId: string) => {
-                for (const m of songs) {
-                    const albumName = (m as any).meta?.albumName || m.name
-                    const singer = m.singer || 'Unknown'
-                    const key = `album_${Buffer.from(`${albumName}__${singer}`).toString('base64url').slice(0, 24)}`
-                    if (!allMusicsMap.has(key)) allMusicsMap.set(key, [])
-                    allMusicsMap.get(key)!.push({ music: m, listId })
-                }
-            }
-            collectInto(listData.loveList, 'love')
-            collectInto(listData.defaultList, 'default')
-            for (const list of listData.userList) collectInto((list.list || []) as LX.Music.MusicInfo[], list.id)
-
-            const entries = allMusicsMap.get(id) || []
-            musics = entries.map(e => e.music)
-            if (musics.length > 0) {
-                listName = (musics[0] as any).meta?.albumName || musics[0].name
-            }
-        } else if (id.includes('_')) {
-            // 动态支持：如果客户端把某首歌的 id 当作专辑 id 来查
-            const found = await this.findMusicById(username, id)
-            if (found) {
-                musics = [found.music]
-                listName = found.music.name
-            } else {
-                // 如果在列表里没找到，尝试解析 ID 构造
-                const parts = id.split('_')
-                const source = parts[0]
-                const songmid = parts.slice(1).join('_')
-                if (musicSdk[source]) {
-                    musics = [{ id, name: 'Unknown', singer: 'Unknown', source, songmid, interval: '0' } as any]
-                    listName = 'Single Album'
-                }
-            }
         } else {
-            const list = listData.userList.find((l: any) => l.id === id)
-            if (list) {
-                listName = list.name
-                musics = (list.list || []) as LX.Music.MusicInfo[]
-            }
+            // [重构] 专辑/歌单/聚合专辑解析统一交给 resolveAlbumMusics，
+            // 与 handleGetMusicDirectory 共用同一套逻辑(修复 OpenSubsonic 客户端点开流派专辑空白)。
+            const resolved = await this.resolveAlbumMusics(username, id)
+            musics = resolved.musics
+            listName = resolved.name
+            albumPublishTime = resolved.albumPublishTime
         }
 
         const albumMeta = {
@@ -1628,6 +1584,44 @@ class SubsonicHandler {
         } else if (id === 'default') {
             musics = listData.defaultList
             dirName = '默认列表'
+        } else if (id.startsWith('onlinepl_')) {
+            // [修复] OpenSubsonic 客户端(音流)用 getMusicDirectory 浏览歌单内容，
+            // 在线歌单(onlinepl_*) 之前未处理 → 返回空白目录。复用 getPlaylist 的在线歌单解析。
+            const rest = id.slice('onlinepl_'.length)
+            const underlineIdx = rest.indexOf('_')
+            const source = underlineIdx > 0 ? rest.slice(0, underlineIdx) : (String(global.lx.config['subsonic.onlinePlaylistSource'] || 'wy'))
+            const playlistId = underlineIdx > 0 ? rest.slice(underlineIdx + 1) : rest
+            try {
+                const detail = await this.fetchOnlinePlaylistDetail(source, playlistId)
+                musics = detail.musics
+                dirName = detail.name
+            } catch (e: any) {
+                console.error(`[Subsonic] getMusicDirectory onlinepl ${id} failed:`, e?.message || e)
+            }
+        } else if (id.includes('_playlist_')) {
+            // [修复] 流派(byGenre)生成的在线歌单专辑(alb_<source>_playlist_<id>)，
+            // 与 getAlbum 走同一套解析，否则 getMusicDirectory 浏览时空白。
+            const marker = '_playlist_'
+            const idx = id.indexOf(marker)
+            const source = id.slice(4, idx)
+            const dissid = id.slice(idx + marker.length)
+            try {
+                const detail = await this.fetchOnlinePlaylistDetail(source, dissid)
+                musics = detail.musics
+                dirName = detail.name
+            } catch (e: any) {
+                console.error(`[Subsonic] getMusicDirectory playlist-album ${id} failed:`, e?.message || e)
+            }
+        } else if (id.startsWith('alb_')) {
+            // [修复] 平台专辑/在线歌单专辑(alb_<source>_xxx) 同样需要能被 getMusicDirectory 浏览，
+            // 否则 OpenSubsonic 客户端点开流派专辑时空白。复用 getAlbum 的曲目解析逻辑。
+            try {
+                const albumResult = await this.resolveAlbumMusics(username, id)
+                musics = albumResult.musics
+                dirName = albumResult.name
+            } catch (e: any) {
+                console.error(`[Subsonic] getMusicDirectory alb ${id} failed:`, e?.message || e)
+            }
         } else {
             const list = listData.userList.find((l: any) => l.id === id)
             if (list) {
@@ -2802,15 +2796,27 @@ class SubsonicHandler {
                 if (parsed) {
                     const pool = await this.getRadioSongPool(parsed.source, parsed.name, parsed.id)
                     if (pool.length > 0) {
-                        console.log(`[Subsonic Radio] stream ${id} pool=${pool.length} picked random`)
-                        const s = pool[Math.floor(Math.random() * pool.length)]
-                        const songmid = (s as any).songmid
-                        const musicInfo: any = { source: parsed.source, songmid, id: `${parsed.source}_${songmid}`, meta: { songId: songmid } }
-                        const result = await callUserApiGetMusicUrl(parsed.source as any, musicInfo, quality, username)
-                        if (result && result.url) {
-                            res.writeHead(302, { Location: result.url })
-                            return res.end()
+                        // [修复] 单首没版权/取不到地址时，不要立刻报错导致客户端"无法播放"，
+                        // 连续尝试若干首随机歌曲，直到取到可播放地址(电台曲库足够大)。
+                        const tries = Math.min(pool.length, 8)
+                        const order = this.shuffleIndices(pool.length).slice(0, tries)
+                        let lastErr = ''
+                        for (const idx of order) {
+                            const s = pool[idx]
+                            const songmid = (s as any).songmid
+                            try {
+                                const musicInfo: any = { source: parsed.source, songmid, id: `${parsed.source}_${songmid}`, meta: { songId: songmid } }
+                                const result = await callUserApiGetMusicUrl(parsed.source as any, musicInfo, quality, username)
+                                if (result && result.url) {
+                                    console.log(`[Subsonic Radio] stream ${id} pool=${pool.length} picked idx=${idx} mid=${songmid}`)
+                                    res.writeHead(302, { Location: result.url })
+                                    return res.end()
+                                }
+                            } catch (e: any) {
+                                lastErr = e?.message || String(e)
+                            }
                         }
+                        return this.sendError(res, 0, `Could not resolve radio track (tried ${tries}${lastErr ? ': ' + lastErr : ''})`, format)
                     }
                     return this.sendError(res, 0, 'Could not resolve radio track', format)
                 }
