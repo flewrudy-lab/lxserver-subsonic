@@ -872,6 +872,18 @@ class SubsonicHandler {
         return lists
     }
 
+    // 从 byTag 缓存读取某在线分类的歌单数与歌曲数(仅命中缓存时返回，不触发网络请求)。
+    // 用于 流派 列表计数展示，避免出现「0 首歌」。
+    private computeOnlineTagCountsFromCache(source: string, tagId: string, perTag: number): { songCount: number, albumCount: number } | null {
+        const cacheKey = `byTag_${source}_${tagId}_${perTag}`
+        const cached = this.getOnlinePlaylistCache(cacheKey, 10 * 60 * 1000)
+        if (!cached || !Array.isArray(cached)) return null
+        const albumCount = cached.length
+        const songCount = cached.reduce((sum: number, p: any) => sum + (Number(p.total) || 0), 0)
+        if (albumCount === 0) return null
+        return { songCount, albumCount }
+    }
+
     // 单飞锁：同一时刻只允许一个在线歌单抓取在进行。
     // 原因：网易云 songList.getList 使用模块级单例 _requestObj_list，并发调用会互相 cancel 对方请求，
     // 导致所有分类都报 "Cancel Request"。手机客户端(音流/Feishin)刷新歌单列表时可能与本请求并发，
@@ -1982,11 +1994,24 @@ class SubsonicHandler {
         const out: any[] = [...genres]
         // [新增] 把在线歌单分类(华语/欧美/古风…)也作为流派暴露，前缀 [在线] 以便与本地曲库流派区分
         if (global.lx.config['subsonic.onlinePlaylists'] !== false) {
+            const perTag = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistPerTag'] || '6')) || 6))
             const sources = this.getOnlineSources()
             for (const source of sources) {
                 const tags: { name: string, id: string }[] = (source === 'tx' ? await this.getTxTags() : await this.getWyTags())
                 for (const tag of tags) {
-                    out.push({ value: `[在线] ${tag.name}`, id: `online_${source}_${tag.id}`, songCount: 0, albumCount: 0 })
+                    // [修复] 流派列表不能写死 0 首歌：优先用 byTag 缓存里的真实歌单数/歌曲数，
+                    // 未命中缓存时用一个保守估计(每分类 6 张歌单 × 平均 40 首)占位，避免 音流 显示「0首歌」。
+                    const cached = this.computeOnlineTagCountsFromCache(source, tag.id, perTag)
+                    let songCount: number
+                    let albumCount: number
+                    if (cached) {
+                        songCount = cached.songCount
+                        albumCount = cached.albumCount
+                    } else {
+                        albumCount = perTag
+                        songCount = perTag * 40
+                    }
+                    out.push({ value: `[在线] ${tag.name}`, id: `online_${source}_${tag.id}`, songCount, albumCount })
                 }
             }
         }
