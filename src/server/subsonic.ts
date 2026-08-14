@@ -472,6 +472,9 @@ class SubsonicHandler {
             parent: parentId,
             title: music.name,
             name: music.name,
+            // 电台伪曲目等场景：meta.streamUrl 为公网可达的绝对播放地址，
+            // 注入 streamUrl/path 让客户端(音流等)直接据此播放，避免"无法播放"。
+            ...(meta.streamUrl ? { streamUrl: meta.streamUrl, path: meta.streamUrl } : {}),
             album: albumName,
             albumId: String(albumId),
             artist: singer,
@@ -1088,6 +1091,30 @@ class SubsonicHandler {
         } as any
     }
 
+    // 构造公网可达的电台/歌曲 stream.view 绝对地址。优先用 subsonic.publicUrl 配置，
+    // 否则回退到请求 Host(仅局域网可用)。用于 getSong/getInternetRadioStations 等需要绝对链接的字段。
+    // req 可选(部分调用路径拿不到 req)，拿不到时直接依赖 subsonic.publicUrl 配置(已默认填隧道地址)。
+    private buildPublicStreamUrl(req: http.IncomingMessage | null, id: string): string {
+        const cfgPublic = String(global.lx.config['subsonic.publicUrl'] || '').trim()
+        let base: string
+        if (cfgPublic) {
+            base = cfgPublic.replace(/\/+$/, '')
+            if (!/^https?:\/\//i.test(base)) base = `https://${base}`
+        } else if (req) {
+            const proto = ((req.headers['x-forwarded-proto'] as string)
+                || (req.socket && (req.socket as any).encrypted ? 'https' : 'http')
+                || 'http') as string
+            const host = ((req.headers['x-forwarded-host'] as string) || (req.headers['host'] as string) || '') as string
+            base = `${proto}://${host}`
+        } else {
+            // [兜底] 配置未生效且无 req 时，回退到部署时已知的公网隧道域名，确保电台 streamUrl 始终可达。
+            base = 'https://lx.flewrudy.pp.ua'
+        }
+        const subsonicPath = (String(global.lx.config['subsonic.path'] || '/rest')).replace(/\/+$/, '') || '/rest'
+        const streamPath = `${subsonicPath}/stream.view`
+        return `${base}${streamPath}?id=${encodeURIComponent(id)}`
+    }
+
     // 聚合某分类下所有热门歌单的歌曲，作为电台随机曲库(带 TTL 缓存)
     private async getRadioSongPool(source: string, tagName: string, tagId: string): Promise<LX.Music.MusicInfo[]> {
         const cacheKey = `radio_${source}_${tagName}_${tagId}`
@@ -1433,19 +1460,25 @@ class SubsonicHandler {
         if (id.startsWith('radio_wy_') || id.startsWith('radio_tx_')) {
             const catRadio = this.buildCategoryRadioPseudoTrack(id)
             if (catRadio) {
+                // [修复] 给电台伪曲目注入公网可达的 streamUrl，否则音流等客户端读 getSong 的
+                // streamUrl/path 字段为空时直接报"无法播放"。
+                const streamUrl = this.buildPublicStreamUrl(null, id)
+                const withUrl = { ...catRadio, meta: { ...(catRadio as any).meta, streamUrl } } as any
                 if (format === 'json') {
-                    return this.sendResponse(res, { song: this.musicToSongFlat(catRadio, id) }, format)
+                    return this.sendResponse(res, { song: this.musicToSongFlat(withUrl, id) }, format)
                 }
-                return this.sendResponse(res, { song: this.musicToSongXml(catRadio, id) }, format)
+                return this.sendResponse(res, { song: this.musicToSongXml(withUrl, id) }, format)
             }
             // 官方 QQ 电台(纯数字 ID)
             const radioId = id.replace('radio_tx_', '')
             const radioName = await this.getRadioName(radioId)
             const radioMusic = this.buildRadioPseudoTrack(radioId, radioName)
+            const streamUrl = this.buildPublicStreamUrl(null, id)
+            const withUrl = { ...radioMusic, meta: { ...(radioMusic as any).meta, streamUrl } } as any
             if (format === 'json') {
-                return this.sendResponse(res, { song: this.musicToSongFlat(radioMusic, id) }, format)
+                return this.sendResponse(res, { song: this.musicToSongFlat(withUrl, id) }, format)
             }
-            return this.sendResponse(res, { song: this.musicToSongXml(radioMusic, id) }, format)
+            return this.sendResponse(res, { song: this.musicToSongXml(withUrl, id) }, format)
         }
 
         const found = await this.findMusicById(username, id)
@@ -2744,6 +2777,7 @@ class SubsonicHandler {
                 if (parsed) {
                     const pool = await this.getRadioSongPool(parsed.source, parsed.name, parsed.id)
                     if (pool.length > 0) {
+                        console.log(`[Subsonic Radio] stream ${id} pool=${pool.length} picked random`)
                         const s = pool[Math.floor(Math.random() * pool.length)]
                         const songmid = (s as any).songmid
                         const musicInfo: any = { source: parsed.source, songmid, id: `${parsed.source}_${songmid}`, meta: { songId: songmid } }
