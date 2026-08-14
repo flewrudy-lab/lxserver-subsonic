@@ -28,15 +28,16 @@
 > **本仓库是 Fork 项目。** 基于 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)（原作者 **XCQ0607**）修改而来，原项目的版权、许可证与完整文档均归原作者所有。本仓库仅在其基础上**追加了 Subsonic API 增强功能**，方便使用 音流 / Feishin 等标准 Subsonic 客户端。
 > ⭐ 如果你喜欢原项目，请到原仓库点 Star 支持原作者。
 
-### 📝 本 Fork 的修改内容
-在 `src/server/subsonic.ts` 中扩展了 Subsonic 协议，使标准音乐客户端可以：
-- **收藏 / 取消收藏歌曲**（`star` / `unstar` → 加入“我喜欢的”列表，并持久化保存）
-- **创建 / 删除歌单**（`createPlaylist` / `deletePlaylist`）
-- **向歌单追加歌曲**（`updatePlaylist?songIdToAdd=...`）
-- **跨音源播放地址兜底**：某音源失效时自动回退到其他可用音源
-- **电台 / 分类（genre）垃圾条目过滤** 与 歌曲元数据在线补全
+### 📝 本 Fork 的修改内容与协议修复
+在 `src/server/subsonic.ts` 中深度重构并扩展了 Subsonic 协议，全面解决了主流第三方客户端（音流、Feishin、DSub、Symfonium 等）的兼容性痛点：
+- **修复流派/歌单专辑“0首歌/空白”问题**：对齐 Subsonic 规范中的 `albumId` 与 `isDir: false`，点开分类歌单与专辑完美加载所有歌曲。
+- **修复电台闪退与播放失败**：兼容 `station` / `internetRadioStation` 双键规范，增加第三方播放器内核免密直拉流支持。
+- **重构首页推荐与最近播放**：废弃不可播放的 QQ 商业新碟接口，“最近”精准对齐用户个人收藏与自建歌单，“随机”聚合高品质精选歌单。
+- **修复本地自建歌单数据丢失**：解决带下划线 ID 被单曲规则误判的问题，自建歌单点开 100% 完整加载。
+- **纯网易云 23 大高可用流派与电台**：下线受 VIP/DRM 限制的腾讯源，全品类网易云精选电台/流派即点即播。
+- **双向收藏、歌单管理与跨音源兜底**：支持 `star`/`unstar`、新建/删除/编辑歌单及无版权时的多音源智能跨源试播。
 
-> 完整技术说明见 [SUBSONIC_ENHANCEMENTS.md](./SUBSONIC_ENHANCEMENTS.md)。
+> 完整问题排查与技术方案详见 [SUBSONIC_ENHANCEMENTS.md](./SUBSONIC_ENHANCEMENTS.md)。
 
 ### 🚀 修改内容使用方法
 1. **构建运行**（与原项目一致）：
