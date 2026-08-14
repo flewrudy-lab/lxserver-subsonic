@@ -2195,23 +2195,37 @@ class SubsonicHandler {
                 }
             }
             if (format === 'json') {
-                return this.sendResponse(res, { internetRadioStations: { internetRadioStation: stations } }, format)
+                return this.sendResponse(res, {
+                    internetRadioStations: {
+                        station: stations,
+                        internetRadioStation: stations,
+                    }
+                }, format)
             }
             return this.sendResponse(res, {
                 internetRadioStations: {
-                    children: { internetRadioStation: stations.map(r => ({ attrs: r })) }
+                    children: {
+                        station: stations.map(r => ({ attrs: r })),
+                        internetRadioStation: stations.map(r => ({ attrs: r })),
+                    }
                 }
             }, format)
         }
         // 兜底: 关闭分类电台时，返回官方电台(需 QQ 登录 Cookie 才能播)
         const radios = await fetchRadios()
         if (format === 'json') {
-            return this.sendResponse(res, { internetRadioStations: { internetRadioStation: radios } }, format)
+            return this.sendResponse(res, {
+                internetRadioStations: {
+                    station: radios,
+                    internetRadioStation: radios,
+                }
+            }, format)
         }
         return this.sendResponse(res, {
             internetRadioStations: {
                 children: {
-                    internetRadioStation: radios.map(r => ({ attrs: r }))
+                    station: radios.map(r => ({ attrs: r })),
+                    internetRadioStation: radios.map(r => ({ attrs: r })),
                 }
             }
         }, format)
