@@ -62,15 +62,15 @@ const config: LX.Config = {
   'subsonic.onlineRadio': true, // 是否把"分类电台"暴露到 Subsonic 电台列表(由在线歌单分类自动生成, 无需手改模板/ID/名称)
   'subsonic.onlineRadioSongCap': 200, // 单个分类电台最多聚合的歌曲数(从各分类热门歌单里随机抽歌, 连续播放)
   'subsonic.publicUrl': '', // 公网可访问地址(如 https://lx.flewrudy.pp.ua)，用于生成电台 streamUrl 等绝对链接；留空则自动用请求 Host(仅局域网可用)。手机端走隧道时必须填写，否则电台 streamUrl 指向 localhost 无法播放
-  'subsonic.onlinePlaylistSources': 'wy,tx', // 暴露哪些平台的在线歌单(逗号分隔): wy(网易云) | tx(QQ音乐) | kw | kg | mg
+  'subsonic.onlinePlaylistSources': 'wy', // 暴露哪些平台的在线歌单(逗号分隔): wy(网易云) | tx(QQ音乐) | kw | kg | mg
   'subsonic.onlinePlaylistSource': 'wy', // 单平台回退值(当 onlinePlaylistSources 未设置时生效)
   'subsonic.onlinePlaylistTags': '', // 可选: 覆盖网易云分类(逗号分隔, 如 华语,古风,欧美)，留空用内置默认分类
-  'subsonic.onlinePlaylistMaxTags': 8, // 每个平台最多取多少个分类(标签)
+  'subsonic.onlinePlaylistMaxTags': 25, // 每个平台最多取多少个分类(标签)
   'subsonic.onlinePlaylistPerTag': 6, // 每个分类最多暴露多少个热门歌单
-  'subsonic.onlinePlaylistCount': 100, // 歌单列表最多暴露的在线歌单总数(硬上限)
+  'subsonic.onlinePlaylistCount': 150, // 歌单列表最多暴露的在线歌单总数(硬上限)
   'subsonic.onlinePlaylistSongCap': 300, // 单个在线歌单最多返回的歌曲数(防止超大 payload)
   'subsonic.lyricTranslation': true, // 是否在 Subsonic 歌词中包含翻译
-  'singer.sourcePriority': ['tx', 'wy'], // 歌手信息源优先级
+  'singer.sourcePriority': ['wy', 'tx'], // 歌手信息源优先级
   'artist.maxFetchPages': 20, // 歌手歌曲最大抓取页数
   'cache.namingPattern': 'simple', // 缓存命名规则
   'system.allowUnsafeVM': false, // 是否允许运行 VM 模式自定义源脚本

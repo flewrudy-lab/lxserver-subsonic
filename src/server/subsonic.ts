@@ -787,7 +787,7 @@ class SubsonicHandler {
         if (raw && typeof raw === 'string' && raw.trim()) {
             return raw.split(',').map((s) => s.trim()).filter(Boolean)
         }
-        const fallback = global.lx.config['subsonic.onlinePlaylistSource'] || 'wy,tx'
+        const fallback = global.lx.config['subsonic.onlinePlaylistSource'] || 'wy'
         return String(fallback).split(',').map((s) => s.trim()).filter(Boolean)
     }
 
@@ -797,8 +797,12 @@ class SubsonicHandler {
         if (override && typeof override === 'string' && override.trim()) {
             return override.split(',').map((t) => t.trim()).filter(Boolean).map((t) => ({ name: t, id: t }))
         }
-        // 内置默认分类(取自网易云 cat 参数常用值，覆盖华语/古风/欧美等)
-        const defaultTags = ['华语', '欧美', '古风', '流行', '轻音乐', '摇滚', '电子', '民谣', '经典', '翻唱']
+        // 内置网易云主流精选标签（覆盖全部常见流派与场景，首首可播）
+        const defaultTags = [
+            '华语', '流行', '摇滚', '民谣', '电子', '古风', '粤语', '经典',
+            '欧美', '日语', '韩语', '轻音乐', '说唱', 'ACG', '治愈', '翻唱',
+            '影视原声', '学习', '工作', '清晨', '夜晚', '运动', '旅行'
+        ]
         return defaultTags.map((t) => ({ name: t, id: t }))
     }
 
@@ -2103,17 +2107,15 @@ class SubsonicHandler {
     }
 
     private async handleGetGenres(res: http.ServerResponse, username: string, format: string) {
-        const genres = await fetchGenres()
-        const out: any[] = [...genres]
-        // [新增] 把在线歌单分类(华语/欧美/古风…)也作为流派暴露，前缀 [在线] 以便与本地曲库流派区分
+        const out: any[] = []
+        // [在线流派] 暴露网易云各精选分类标签为流派
         if (global.lx.config['subsonic.onlinePlaylists'] !== false) {
             const perTag = Math.max(1, Math.min(30, parseInt(String(global.lx.config['subsonic.onlinePlaylistPerTag'] || '6')) || 6))
             const sources = this.getOnlineSources()
             for (const source of sources) {
                 const tags: { name: string, id: string }[] = (source === 'tx' ? await this.getTxTags() : await this.getWyTags())
                 for (const tag of tags) {
-                    // [修复] 流派列表不能写死 0 首歌：优先用 byTag 缓存里的真实歌单数/歌曲数，
-                    // 未命中缓存时用一个保守估计(每分类 6 张歌单 × 平均 40 首)占位，避免 音流 显示「0首歌」。
+                    // 流派列表计数展示：优先用缓存的真实歌单数/歌曲数
                     const cached = this.computeOnlineTagCountsFromCache(source, tag.id, perTag)
                     let songCount: number
                     let albumCount: number
@@ -2122,7 +2124,7 @@ class SubsonicHandler {
                         albumCount = cached.albumCount
                     } else {
                         albumCount = perTag
-                        songCount = perTag * 40
+                        songCount = perTag * 50
                     }
                     out.push({ value: `[在线] ${tag.name}`, id: `online_${source}_${tag.id}`, songCount, albumCount })
                 }
